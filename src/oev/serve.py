@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -113,9 +114,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default=os.environ.get("OEV_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=os.environ.get("OEV_PORT", "8000"))
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=os.environ.get("OEV_MAX_CONCURRENCY", "4"),
+        help="Maximum simultaneous model inferences (default: OEV_MAX_CONCURRENCY or 4)",
+    )
     args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    if args.max_concurrency < 1:
+        parser.error("max-concurrency must be positive")
 
     engine = DecisionEngine.from_pretrained(
         args.model,
@@ -124,7 +135,9 @@ def main(argv: list[str] | None = None) -> None:
         dtype=args.dtype,
         max_input_tokens=args.max_input_tokens,
     )
-    service = SystemOneService(engine, args.served_model or args.model)
+    service = SystemOneService(
+        engine, args.served_model or args.model, max_concurrency=args.max_concurrency
+    )
 
     import uvicorn
 

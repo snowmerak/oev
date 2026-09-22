@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import json
-from threading import Lock
+from threading import BoundedSemaphore
 from typing import Any, Mapping
 
 from .engine import DecisionEngine
@@ -125,13 +125,17 @@ class SystemOneService:
         model: str,
         *,
         release_date: str | None = None,
+        max_concurrency: int = 4,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
+        if type(max_concurrency) is not int or max_concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer")
         self.engine = engine
         self.model = model
         self.release_date = release_date or date.today().isoformat()
-        self._lock = Lock()
+        self.max_concurrency = max_concurrency
+        self._inference_slots = BoundedSemaphore(max_concurrency)
 
     def models(self) -> dict[str, Any]:
         return {
@@ -163,34 +167,34 @@ class SystemOneService:
 
         answers: dict[str, dict[str, Any]] = {}
         input_tokens = 0
-        with self._lock:
-            for question in prepared:
-                if question.decision is None:
-                    probabilities = [1.0]
-                else:
+        for question in prepared:
+            if question.decision is None:
+                probabilities = [1.0]
+            else:
+                with self._inference_slots:
                     result = self.engine.decide(question.decision)
-                    probabilities = [result.probabilities[key] for key in question.keys]
-                    input_tokens += result.input_tokens
-                distribution = dict(zip(question.keys, probabilities))
+                probabilities = [result.probabilities[key] for key in question.keys]
+                input_tokens += result.input_tokens
+            distribution = dict(zip(question.keys, probabilities))
 
-                if question.kind == "noul":
-                    answers[question.name] = {"type": "noul", "noul": distribution["true"]}
-                elif question.kind == "choice":
-                    winner = max(question.keys, key=distribution.__getitem__)
-                    answers[question.name] = {
-                        "type": "choice",
-                        "choice": winner,
-                        "confidence": _confidence(probabilities),
-                        "probabilities": distribution,
-                    }
-                else:
-                    answers[question.name] = {
-                        "type": "score",
-                        "score": sum(index * p for index, p in enumerate(probabilities)),
-                        "confidence": _score_confidence(probabilities),
-                        "legend": question.legend,
-                        "probabilities": distribution,
-                    }
+            if question.kind == "noul":
+                answers[question.name] = {"type": "noul", "noul": distribution["true"]}
+            elif question.kind == "choice":
+                winner = max(question.keys, key=distribution.__getitem__)
+                answers[question.name] = {
+                    "type": "choice",
+                    "choice": winner,
+                    "confidence": _confidence(probabilities),
+                    "probabilities": distribution,
+                }
+            else:
+                answers[question.name] = {
+                    "type": "score",
+                    "score": sum(index * p for index, p in enumerate(probabilities)),
+                    "confidence": _score_confidence(probabilities),
+                    "legend": question.legend,
+                    "probabilities": distribution,
+                }
 
         return {
             "model": self.model,

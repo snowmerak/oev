@@ -1,9 +1,13 @@
+from concurrent.futures import ThreadPoolExecutor
 import math
+from threading import Condition, Event
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from oev import Decision, DecisionEngine, Option
+from oev import serve
 from oev.serve import create_app
 from oev.systemone import SystemOneService
 
@@ -164,3 +168,64 @@ def test_one_option_is_deterministic_and_needs_no_inference():
     assert response["answers"]["rating"]["score"] == 0.0
     assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
     assert not backend.prompts
+
+
+def test_concurrent_requests_share_one_model_with_a_bounded_inference_limit():
+    class BlockingEngine:
+        def __init__(self):
+            self.condition = Condition()
+            self.release = Event()
+            self.active = 0
+            self.peak = 0
+
+        def decide(self, decision):
+            with self.condition:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                self.condition.notify_all()
+            try:
+                assert self.release.wait(timeout=5)
+                return SimpleNamespace(probabilities={"a": 0.25, "b": 0.75}, input_tokens=10)
+            finally:
+                with self.condition:
+                    self.active -= 1
+                    self.condition.notify_all()
+
+    engine = BlockingEngine()
+    service = SystemOneService(engine, "oev-test", max_concurrency=2)
+    request = {
+        "model": "oev-test",
+        "state": "state",
+        "questions": {"route": {"type": "choice", "criteria": {"a": "A", "b": "B"}}},
+    }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(service.evaluate, request) for _ in range(3)]
+        try:
+            with engine.condition:
+                assert engine.condition.wait_for(lambda: engine.active == 2, timeout=5)
+                assert not engine.condition.wait_for(lambda: engine.active > 2, timeout=0.1)
+        finally:
+            engine.release.set()
+        assert [future.result()["answers"]["route"]["choice"] for future in futures] == ["b"] * 3
+    assert engine.peak == 2
+    assert SystemOneService(engine, "oev-test").max_concurrency == 4
+    with pytest.raises(ValueError, match="positive integer"):
+        SystemOneService(engine, "oev-test", max_concurrency=0)
+
+
+def test_server_reads_binding_and_concurrency_from_env_with_cli_overrides(monkeypatch):
+    monkeypatch.setenv("OEV_HOST", "0.0.0.0")
+    monkeypatch.setenv("OEV_PORT", "8100")
+    monkeypatch.setenv("OEV_MAX_CONCURRENCY", "3")
+    monkeypatch.setattr(serve.DecisionEngine, "from_pretrained", lambda *args, **kwargs: object())
+    monkeypatch.setattr(serve, "create_app", lambda service: service)
+    launched = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: launched.append((app, kwargs)))
+
+    serve.main(["--model", "fake"])
+    assert launched[-1][0].max_concurrency == 3
+    assert launched[-1][1] == {"host": "0.0.0.0", "port": 8100}
+
+    serve.main(["--model", "fake", "--host", "127.0.0.1", "--port", "8200", "--max-concurrency", "2"])
+    assert launched[-1][0].max_concurrency == 2
+    assert launched[-1][1] == {"host": "127.0.0.1", "port": 8200}

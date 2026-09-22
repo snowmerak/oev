@@ -85,10 +85,15 @@ HTTP 배포에는 System One 요청과 응답 형식의 `POST /v1/systemone`, `G
 
 ```powershell
 uv sync --locked --extra hf --extra serve
-uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device cpu --dtype bfloat16
+$env:OEV_HOST = "127.0.0.1"
+$env:OEV_PORT = "8000"
+$env:OEV_MAX_CONCURRENCY = "4"
+uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device hybrid-cuda --dtype bfloat16
 ```
 
-6GB CUDA GPU에서는 `--device hybrid-cuda --dtype bfloat16`을 사용합니다. 이 모드는 Gemma 4와 bfloat16 지원 CUDA GPU에만 적용됩니다.
+`OEV_HOST`, `OEV_PORT`, `OEV_MAX_CONCURRENCY`의 기본값은 각각 `127.0.0.1`, `8000`, `4`입니다. `--host`, `--port`, `--max-concurrency` 인자가 환경변수보다 우선합니다. 한 서버 프로세스가 모델을 한 번 로드하며, 동시에 최대 4번의 모델 추론을 허용합니다. 한 요청 안의 여러 질문은 차례로 실행하고, 한도를 넘는 요청은 기다립니다. 동시 추론은 처리 속도 향상을 보장하지 않으며 입력 길이에 따라 GPU 메모리 사용량이 늘어날 수 있습니다.
+
+장치 기본값은 `auto`입니다. 위 예시는 6GB CUDA GPU용으로 `hybrid-cuda`를 명시했습니다. 이 모드는 Gemma 4와 bfloat16 지원 CUDA GPU에만 적용됩니다.
 
 ```json
 {
