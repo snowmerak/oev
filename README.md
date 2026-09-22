@@ -1,6 +1,6 @@
 # oev
 
-`oev`는 언어 모델로 여러 선택지 중 하나를 고르는 작은 Python 라이브러리입니다. `state`, `question`, `options`를 프롬프트로 만들고 모델을 한 번 실행한 뒤, 다음 토큰 위치에서 선택지 문자 `A`–`T`의 logit을 읽습니다. 답변 문장이나 JSON을 생성하지 않습니다. [SemIf](https://github.com/TheoLeeCJ/SemIf)의 직접 logit 판독 방식을 참고했습니다.
+`oev`는 언어 모델로 여러 선택지 중 하나를 고르는 작은 Python 라이브러리입니다. `state`, `question`, `options`를 프롬프트로 만들고 모델을 한 번 실행한 뒤, 다음 토큰 위치에서 선택지 문자 `A`–`Y`의 logit을 읽습니다. 답변 문장이나 JSON을 생성하지 않습니다. [SemIf](https://github.com/TheoLeeCJ/SemIf)의 직접 logit 판독 방식을 참고했습니다.
 
 기본 모델은 `google/gemma-4-E2B-it`입니다. `--model`에 다른 Hugging Face causal LM의 모델 ID 또는 Transformers 형식의 로컬 체크포인트 경로를 넣을 수 있습니다. GGUF 파일은 현재 지원하지 않습니다.
 
@@ -23,11 +23,11 @@ uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --dev
 
 | 운영체제 | PyTorch 배포본 | 사용 가능한 `--device` |
 | --- | --- | --- |
-| Windows | CUDA 13.0 빌드 | `cuda` 또는 `cpu` |
+| Windows | CUDA 13.0 빌드 | `cuda`, `hybrid-cuda` 또는 `cpu` |
 | macOS | PyPI 빌드 | MPS 지원 기기에서는 `mps`, 그 외에는 `cpu` |
-| Linux | PyPI 빌드 | CUDA 사용 가능 시 `cuda`, 그 외에는 `cpu` |
+| Linux | PyPI 빌드 | CUDA 사용 가능 시 `cuda` 또는 `hybrid-cuda`, 그 외에는 `cpu` |
 
-잠금 파일은 같은 운영체제 안에서 GPU 유무를 구분하지 않습니다. 따라서 GPU가 없는 Windows PC에도 CUDA 빌드가 설치되지만 `--device cpu`로 실행할 수 있습니다. `--device auto`는 사용 가능한 CUDA, MPS, CPU 순으로 선택하며 VRAM 용량을 확인하지 않습니다. [Google의 메모리 표](https://ai.google.dev/gemma/docs/core)에 따르면 Gemma 4 E2B의 BF16 추론에는 약 11.4GB가 필요합니다. 6GB GPU에서는 기본 CLI의 `--device cuda` 대신 아래의 CPU 명령 또는 GPU와 CPU를 함께 쓰는 [하이브리드 실행](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)을 사용하세요.
+잠금 파일은 같은 운영체제 안에서 GPU 유무를 구분하지 않습니다. 따라서 GPU가 없는 Windows PC에도 CUDA 빌드가 설치되지만 `--device cpu`로 실행할 수 있습니다. `--device auto`는 사용 가능한 CUDA, MPS, CPU 순으로 선택하며 VRAM 용량을 확인하지 않습니다. [Google의 메모리 표](https://ai.google.dev/gemma/docs/core)에 따르면 Gemma 4 E2B의 BF16 추론에는 약 11.4GB가 필요합니다. 6GB GPU에서는 Gemma 4 전용 `--device hybrid-cuda --dtype bfloat16`으로 임베딩과 출력 헤드를 CPU에 두고 디코더 층을 GPU에 올릴 수 있습니다. 이 방식의 [평가 결과](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)도 있습니다.
 
 ## 입력과 출력
 
@@ -42,7 +42,7 @@ uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --dev
 | `id` | 결과를 연결할 기록 ID. 생략하면 파일의 문항 순번을 사용합니다. |
 | `state` | 판단에 필요한 문자열, JSON 객체 또는 배열. |
 | `question` | 선택 기준을 설명하는 문장. |
-| `options` | 2–20개의 `{ "id", "description" }` 객체. 순서대로 A–T에 대응합니다. |
+| `options` | 2–25개의 `{ "id", "description" }` 객체. 순서대로 A–Y에 대응합니다. |
 
 결과도 JSONL로 쓰며, 핵심 필드는 다음과 같습니다.
 
@@ -78,6 +78,35 @@ print(result.selected_id, result.logits, result.elapsed_seconds)
 ```
 
 `DecisionEngine`은 선택지 logit을 반환하는 백엔드와 프롬프트·결과 매핑을 분리합니다. `from_pretrained`는 Hugging Face 백엔드를 로드하고, 같은 API에 호환 모델의 ID나 로컬 경로를 지정할 수 있습니다. 다른 런타임을 붙일 때는 `LogitBackend` 프로토콜의 `tokenizer`, `model_name`, `selected_logits(input_ids, answer_token_ids)`를 구현해 `DecisionEngine(backend)`에 전달하면 됩니다.
+
+## System One API
+
+HTTP 배포에는 System One 요청과 응답 형식의 `POST /v1/systemone`, `GET /v1/models`를 사용합니다. 서버는 기본적으로 로컬 주소 `127.0.0.1:8000`에서 실행합니다.
+
+```powershell
+uv sync --locked --extra hf --extra serve
+uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device cpu --dtype bfloat16
+```
+
+6GB CUDA GPU에서는 `--device hybrid-cuda --dtype bfloat16`을 사용합니다. 이 모드는 Gemma 4와 bfloat16 지원 CUDA GPU에만 적용됩니다.
+
+```json
+{
+  "model": "google/gemma-4-E2B-it",
+  "state": {"message": "환불 요청입니다"},
+  "questions": {
+    "route": {"type": "choice", "instructions": "어느 팀으로 보낼까?", "criteria": {"billing": "결제팀", "support": "고객지원팀"}},
+    "urgent": {"type": "noul", "instructions": "긴급 처리해야 하나?"},
+    "priority": {"type": "score", "instructions": "긴급도는?", "criteria": ["대기 가능", "이번 주", "오늘"]}
+  }
+}
+```
+
+공식 Python SDK에서는 `base_url="http://127.0.0.1:8000"`과 위의 `model` 이름을 지정하면 됩니다. 로컬 서버는 API 키를 검사하지 않지만 SDK 생성자에는 임의의 로컬 키를 전달할 수 있습니다.
+
+요청의 모든 질문은 같은 `state`를 사용하며 oev는 질문마다 모델을 한 번 실행합니다. `choice`와 `score`는 최대 25개 선택지 또는 수준을 받습니다. `noul`은 `false`와 `true` 두 선택지의 확률을 계산해 `p(true)`를 반환합니다. `score`는 수준 번호의 확률 가중평균을 반환합니다. 한 선택지 또는 한 수준만 있으면 모델 실행 없이 결정합니다.
+
+`confidence`는 확률 분포의 집중도를 요약한 값입니다. `choice`는 `(최대 확률 − 1/K) / (1 − 1/K)`, `score`는 최빈 수준까지의 평균 거리를 사용합니다. oev의 확률과 confidence는 보정된 정답 확률이 아니므로 자동 처리 임계값은 실제 사용 데이터에서 검증해야 합니다. `usage.input_tokens`는 질문별 입력 토큰 수의 합계이며, 토큰을 생성하지 않아 `usage.output_tokens`는 0입니다. 기본 서버는 인증을 제공하지 않으므로 외부에 공개할 때는 인증과 TLS를 앞단에 구성해야 합니다.
 
 ## 계산 방식과 범위
 

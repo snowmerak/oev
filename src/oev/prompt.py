@@ -6,9 +6,9 @@ import hashlib
 import json
 from typing import Protocol
 
-from .types import Decision
+from .types import Decision, MAX_OPTIONS
 
-LETTERS = "ABCDEFGHIJKLMNOPQRST"
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:MAX_OPTIONS]
 SYSTEM_PROMPT = (
     "Apply the question to the supplied state. Choose exactly one listed option. "
     "Reply with only its uppercase letter, without explanation or reasoning."

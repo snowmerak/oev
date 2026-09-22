@@ -31,12 +31,18 @@ class DecisionEngine:
         dtype: str = "auto",
         max_input_tokens: int = 4096,
     ) -> "DecisionEngine":
-        from .hf import HuggingFaceBackend
+        if device == "hybrid-cuda":
+            from .hybrid import HybridGemma4Backend
 
-        return cls(
-            HuggingFaceBackend.load(model, revision=revision, device=device, dtype=dtype),
-            max_input_tokens=max_input_tokens,
-        )
+            if dtype not in {"auto", "bfloat16"}:
+                raise ValueError("hybrid-cuda requires bfloat16")
+            backend = HybridGemma4Backend.load(model, revision=revision)
+        else:
+            from .hf import HuggingFaceBackend
+
+            backend = HuggingFaceBackend.load(model, revision=revision, device=device, dtype=dtype)
+
+        return cls(backend, max_input_tokens=max_input_tokens)
 
     def decide(self, decision: Decision) -> DecisionResult:
         started = time.perf_counter()

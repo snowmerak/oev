@@ -77,3 +77,20 @@ def test_rejects_bad_inputs_and_nonfinite_scores():
 
 def test_softmax_handles_large_logits():
     assert conditional_softmax([10000.0, 9999.0]) == pytest.approx([0.7310586, 0.2689414])
+
+
+def test_hybrid_device_uses_the_gemma_backend(monkeypatch):
+    from oev.hybrid import HybridGemma4Backend
+
+    backend = CountingBackend()
+    monkeypatch.setattr(
+        HybridGemma4Backend,
+        "load",
+        lambda source, *, revision: backend,
+    )
+    engine = DecisionEngine.from_pretrained(
+        "gemma", revision="commit", device="hybrid-cuda", dtype="bfloat16"
+    )
+    assert engine.backend is backend
+    with pytest.raises(ValueError, match="requires bfloat16"):
+        DecisionEngine.from_pretrained("gemma", device="hybrid-cuda", dtype="float32")

@@ -6,3 +6,5 @@ results/*
 !results/gemma4-e2b*.jsonl
 !results/smollm2-cpu.jsonl
 dist/
+.q
+ 

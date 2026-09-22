@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read option logits from one model forward pass per decision")
     parser.add_argument("--model", default="google/gemma-4-E2B-it", help="Hugging Face model ID or local path")
     parser.add_argument("--revision", help="Hugging Face commit revision for reproducible runs")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument("--input", type=Path, default=Path("examples/decisions.jsonl"))

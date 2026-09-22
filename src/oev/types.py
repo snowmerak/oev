@@ -8,6 +8,9 @@ import math
 from typing import Any
 
 
+MAX_OPTIONS = 25
+
+
 @dataclass(frozen=True)
 class Option:
     id: str
@@ -35,8 +38,8 @@ class Decision:
             raise ValueError("state must be finite JSON data") from exc
         if not isinstance(self.question, str) or not self.question.strip():
             raise ValueError("question must be a nonempty string")
-        if not isinstance(self.options, tuple) or not 2 <= len(self.options) <= 20:
-            raise ValueError("options must be a tuple of 2 to 20 entries")
+        if not isinstance(self.options, tuple) or not 2 <= len(self.options) <= MAX_OPTIONS:
+            raise ValueError(f"options must be a tuple of 2 to {MAX_OPTIONS} entries")
         if any(not isinstance(option, Option) for option in self.options):
             raise ValueError("every option must be an Option")
         if len({option.id for option in self.options}) != len(self.options):

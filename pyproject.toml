@@ -13,7 +13,8 @@ dependencies = []
 
 [project.optional-dependencies]
 hf = ["torch>=2.6", "transformers>=5.0,<6", "accelerate>=1.0"]
-test = ["pytest>=8.0"]
+serve = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+test = ["pytest>=8.0", "httpx>=0.27"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
@@ -25,6 +26,7 @@ explicit = true
 
 [project.scripts]
 oev = "oev.cli:main"
+oev-serve = "oev.serve:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/oev"]
