@@ -1,0 +1,2 @@
+{"id":"route-1","state":"고객이 비밀번호를 재설정했지만 계정 잠금 메시지 때문에 로그인할 수 없다.","question":"어느 팀으로 보내야 하나?","options":[{"id":"account","description":"계정 접근 지원"},{"id":"billing","description":"결제 지원"}]}
+{"id":"route-2","state":{"message":"환불이 아직 입금되지 않았습니다.","days_since_request":10},"question":"어느 팀으로 보내야 하나?","options":[{"id":"account","description":"계정 접근 지원"},{"id":"billing","description":"결제 및 환불 지원"}]}

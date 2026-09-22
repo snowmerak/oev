@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oev"
+version = "0.1.0"
+description = "Fast typed decisions from next-token logits of local language models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+hf = ["torch>=2.6", "transformers>=5.0,<6", "accelerate>=1.0"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+oev = "oev.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
