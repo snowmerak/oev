@@ -19,7 +19,15 @@ uv run --locked --extra hf oev --model google/gemma-4-E2B-it --device cpu --dtyp
 uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu --input examples/decisions.jsonl --output results/smoke.jsonl
 ```
 
-이 작은 모델은 동작 확인용입니다. 분류 품질은 Gemma 4 E2B 결과를 대신하지 않습니다. CUDA와 bfloat16을 지원하는 GPU에서는 `--device cuda --dtype bfloat16`을 사용할 수 있습니다. `--device auto`는 사용 가능한 CUDA, MPS, CPU 순으로 선택합니다.
+이 작은 모델은 동작 확인용입니다. 분류 품질은 Gemma 4 E2B 결과를 대신하지 않습니다. `uv.lock`은 운영체제에 따라 PyTorch 배포본을 선택합니다.
+
+| 운영체제 | PyTorch 배포본 | 사용 가능한 `--device` |
+| --- | --- | --- |
+| Windows | CUDA 13.0 빌드 | `cuda` 또는 `cpu` |
+| macOS | PyPI 빌드 | MPS 지원 기기에서는 `mps`, 그 외에는 `cpu` |
+| Linux | PyPI 빌드 | CUDA 사용 가능 시 `cuda`, 그 외에는 `cpu` |
+
+잠금 파일은 같은 운영체제 안에서 GPU 유무를 구분하지 않습니다. 따라서 GPU가 없는 Windows PC에도 CUDA 빌드가 설치되지만 `--device cpu`로 실행할 수 있습니다. `--device auto`는 사용 가능한 CUDA, MPS, CPU 순으로 선택하며 VRAM 용량을 확인하지 않습니다. [Google의 메모리 표](https://ai.google.dev/gemma/docs/core)에 따르면 Gemma 4 E2B의 BF16 추론에는 약 11.4GB가 필요합니다. 6GB GPU에서는 기본 CLI의 `--device cuda` 대신 아래의 CPU 명령 또는 GPU와 CPU를 함께 쓰는 [하이브리드 실행](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)을 사용하세요.
 
 ## 입력과 출력
 
@@ -79,7 +87,7 @@ Gemma 4 백엔드는 마지막 은닉 상태를 **선택지 토큰에 해당하�
 
 ## 평가 재현
 
-현재 CPU 결과와 선택지별 logit은 [기본 13문항 보고서](reports/gemma4-e2b-cpu.md)와 [스트레스 평가 요약](reports/gemma4-e2b-stress-summary.md)에 있습니다. 스트레스 평가의 상세 logit은 요약 보고서에서 각 실험 보고서로 이어집니다. 직접 만든 소규모 문항이므로 결과 비율을 일반적인 정확도로 해석하면 안 됩니다.
+현재 CPU 결과와 선택지별 logit은 [기본 13문항 보고서](reports/gemma4-e2b-cpu.md)와 [스트레스 평가 요약](reports/gemma4-e2b-stress-summary.md)에 있습니다. 6GB GPU와 CPU RAM을 함께 사용한 실행 결과는 [GPU 하이브리드 16문항 보고서](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)에 있습니다. 직접 만든 소규모 문항이므로 결과 비율을 일반적인 정확도로 해석하면 안 됩니다.
 
 스트레스 평가의 원본 문항은 `examples/stress-challenges.jsonl`과 `examples/stress-semantic20-hard.jsonl`에 있습니다. 아래 명령은 기존 11문항을 20회씩 순서 변경한 220건과 후속 문항을 고정 시드로 생성합니다.
 

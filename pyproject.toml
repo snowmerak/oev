@@ -15,6 +15,14 @@ dependencies = []
 hf = ["torch>=2.6", "transformers>=5.0,<6", "accelerate>=1.0"]
 test = ["pytest>=8.0"]
 
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [project.scripts]
 oev = "oev.cli:main"
 
