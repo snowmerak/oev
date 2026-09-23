@@ -81,7 +81,7 @@ print(result.selected_id, result.logits, result.elapsed_seconds)
 
 ## System One API
 
-HTTP 배포에는 System One 요청과 응답 형식의 `POST /v1/systemone`, `GET /v1/models`를 사용합니다. 서버는 기본적으로 로컬 주소 `127.0.0.1:8000`에서 실행합니다.
+HTTP 배포에는 System One 요청과 응답 형식의 `POST /v1/systemone`, `GET /v1/models`를 사용합니다. LLM이 API를 바로 적용할 수 있는 Markdown 문서는 `GET /.skill`에서 제공합니다. 서버는 기본적으로 로컬 주소 `127.0.0.1:8000`에서 실행합니다.
 
 ```powershell
 uv sync --locked --extra hf --extra serve

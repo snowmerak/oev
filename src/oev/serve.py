@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from importlib.resources import files
 import os
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .engine import DecisionEngine
@@ -16,6 +18,7 @@ from .types import MAX_OPTIONS
 
 Content = str | dict[str, Any] | list[Any] | None
 Level = str | dict[str, Any] | list[Any]
+SKILL_MARKDOWN = files("oev").joinpath("systemone.skill.md").read_text(encoding="utf-8")
 
 
 class ChoiceQuestion(BaseModel):
@@ -91,6 +94,10 @@ class ModelMetadataList(BaseModel):
 
 def create_app(service: SystemOneService) -> FastAPI:
     app = FastAPI(title="oev System One", version="0.1.0")
+
+    @app.get("/.skill", response_class=PlainTextResponse, include_in_schema=False)
+    def skill() -> PlainTextResponse:
+        return PlainTextResponse(SKILL_MARKDOWN, media_type="text/markdown")
 
     @app.get("/v1/models", response_model=ModelMetadataList)
     def models() -> dict[str, Any]:

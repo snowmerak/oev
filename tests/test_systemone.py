@@ -112,6 +112,13 @@ def test_twenty_five_options_reach_y_and_twenty_six_are_rejected():
 def test_http_contract_and_validation_before_inference():
     service, backend = service_for([[0.0, 1.0]])
     client = TestClient(create_app(service))
+    skill = client.get("/.skill")
+    assert skill.status_code == 200
+    assert skill.headers["content-type"].startswith("text/markdown")
+    assert "name: oev-system-one" in skill.text
+    assert "GET /v1/models" in skill.text
+    assert "POST /v1/systemone" in skill.text
+    assert "not a calibrated" in skill.text
     assert client.get("/v1/models").json() == {
         "models": [
             {
