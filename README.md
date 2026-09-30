@@ -1,62 +1,62 @@
 # oev
 
-`oev`는 언어 모델로 여러 선택지 중 하나를 고르는 작은 Python 라이브러리입니다. `state`, `question`, `options`를 프롬프트로 만들고 모델을 한 번 실행한 뒤, 다음 토큰 위치에서 선택지 문자 `a`–`z`, `0`–`9`의 logit을 읽습니다. 답변 문장이나 JSON을 생성하지 않습니다. [SemIf](https://github.com/TheoLeeCJ/SemIf)의 직접 logit 판독 방식을 참고했습니다.
+`oev` is a small Python library for choosing one option with a language model. It builds a prompt from `state`, `question`, and `options`, runs the model once, and reads the next-token logits for option labels `a`–`z` and `0`–`9`. It does not generate an answer sentence or JSON. The direct logit readout approach is inspired by [SemIf](https://github.com/TheoLeeCJ/SemIf).
 
-기본 모델은 `google/gemma-4-E2B-it`입니다. `--model`에 다른 Hugging Face causal LM의 모델 ID 또는 Transformers 형식의 로컬 체크포인트 경로를 넣을 수 있습니다. GGUF 파일은 현재 지원하지 않습니다.
+The default model is `google/gemma-4-E2B-it`. Use `--model` to select another compatible Hugging Face causal LM or a local checkpoint in Transformers format. GGUF files are not currently supported.
 
-## 빠른 시작
+## Quick start
 
-Python 3.11과 `uv` 기준입니다.
+These examples use Python 3.11 and `uv`.
 
 ```powershell
 uv sync --locked --extra hf --extra test
 uv run --locked --extra hf oev --model google/gemma-4-E2B-it --device cpu --dtype bfloat16 --input examples/decisions.jsonl --output results/demo.jsonl
 ```
 
-모델 가중치가 캐시에 없으면 첫 실행에 다운로드합니다. CPU에서도 실행되지만 Gemma 4 E2B는 메모리와 시간이 많이 듭니다. 먼저 CLI와 모델 교체만 확인하려면 작은 모델을 사용할 수 있습니다.
+Model weights are downloaded on the first run if they are not cached. CPU inference works, but Gemma 4 E2B needs substantial memory and processing time. To check the CLI and model loading with a smaller model:
 
 ```powershell
 uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --device cpu --input examples/decisions.jsonl --output results/smoke.jsonl
 ```
 
-이 작은 모델은 동작 확인용입니다. 분류 품질은 Gemma 4 E2B 결과를 대신하지 않습니다. `uv.lock`은 운영체제에 따라 PyTorch 배포본을 선택합니다.
+This small model is intended for smoke tests. Its classification quality does not represent Gemma 4 E2B. `uv.lock` selects a PyTorch distribution based on the operating system.
 
-| 운영체제 | PyTorch 배포본 | 사용 가능한 `--device` |
+| Operating system | PyTorch distribution | Available `--device` values |
 | --- | --- | --- |
-| Windows | CUDA 13.0 빌드 | `cuda`, `hybrid-cuda` 또는 `cpu` |
-| macOS | PyPI 빌드 | MPS 지원 기기에서는 `mps`, 그 외에는 `cpu` |
-| Linux | PyPI 빌드 | CUDA 사용 가능 시 `cuda` 또는 `hybrid-cuda`, 그 외에는 `cpu` |
+| Windows | CUDA 13.0 build | `cuda`, `hybrid-cuda`, or `cpu` |
+| macOS | PyPI build | `mps` on supported hardware, otherwise `cpu` |
+| Linux | PyPI build | `cuda` or `hybrid-cuda` when CUDA is available, otherwise `cpu` |
 
-잠금 파일은 같은 운영체제 안에서 GPU 유무를 구분하지 않습니다. 따라서 GPU가 없는 Windows PC에도 CUDA 빌드가 설치되지만 `--device cpu`로 실행할 수 있습니다. `--device auto`는 사용 가능한 CUDA, MPS, CPU 순으로 선택하며 VRAM 용량을 확인하지 않습니다. [Google의 메모리 표](https://ai.google.dev/gemma/docs/core)에 따르면 Gemma 4 E2B의 BF16 추론에는 약 11.4GB가 필요합니다. 6GB GPU에서는 Gemma 4 전용 `--device hybrid-cuda --dtype bfloat16`으로 임베딩과 출력 헤드를 CPU에 두고 디코더 층을 GPU에 올릴 수 있습니다. 이 방식의 [평가 결과](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)도 있습니다.
+The lockfile does not distinguish between machines with and without a GPU on the same operating system. Windows machines without a GPU still install the CUDA build and can run with `--device cpu`. `--device auto` selects CUDA, MPS, then CPU in order of availability; it does not check VRAM capacity. [Google's memory table](https://ai.google.dev/gemma/docs/core) lists approximately 11.4 GB for Gemma 4 E2B BF16 inference. On a 6 GB GPU, the Gemma 4-specific `--device hybrid-cuda --dtype bfloat16` mode keeps embeddings and the output head on the CPU while placing decoder layers on the GPU. See the [hybrid evaluation results](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md).
 
-## 입력과 출력
+## Input and output
 
-입력은 한 줄에 하나의 JSON 객체를 담은 JSONL입니다.
+Input uses JSONL: one JSON object per line.
 
 ```json
-{"id":"route-1","state":"비밀번호 재설정 후에도 계정이 잠겨 있다.","question":"어느 팀으로 보내야 하나?","options":[{"id":"account","description":"계정 접근 지원"},{"id":"billing","description":"결제 지원"}]}
+{"id":"route-1","state":"The account is still locked after a password reset.","question":"Which team should handle this?","options":[{"id":"account","description":"Account access support"},{"id":"billing","description":"Billing support"}]}
 ```
 
-| 입력 필드 | 의미 |
+| Input field | Meaning |
 | --- | --- |
-| `id` | 결과를 연결할 기록 ID. 생략하면 파일의 문항 순번을 사용합니다. |
-| `state` | 판단에 필요한 문자열, JSON 객체 또는 배열. |
-| `question` | 선택 기준을 설명하는 문장. |
-| `options` | 2–36개의 `{ "id", "description" }` 객체. 순서대로 `a`–`z`, `0`–`9`에 대응합니다. |
+| `id` | Record ID used to associate the result with its input. Defaults to the record's position in the file. |
+| `state` | A string, JSON object, or array containing the facts needed for the decision. |
+| `question` | The instruction describing how to choose. |
+| `options` | 2–36 objects with `id` and `description`, mapped in order to `a`–`z`, then `0`–`9`. |
 
-결과도 JSONL로 쓰며, 핵심 필드는 다음과 같습니다.
+Results are also written as JSONL. The main fields are:
 
-| 출력 필드 | 의미 |
+| Output field | Meaning |
 | --- | --- |
-| `selected_id` | 가장 높은 logit을 얻은 선택지의 ID. |
-| `logits` | 각 선택지 문자 토큰의 원래 logit. |
-| `probabilities` | 제시된 선택지 logit끼리만 softmax한 값. |
-| `input_tokens`, `elapsed_seconds` | 프롬프트 토큰 수와 해당 문항의 처리 시간. |
-| `prompt_sha256`, `model` | 프롬프트 해시와 모델 식별자. 가능한 경우 체크포인트 리비전도 포함합니다. |
+| `selected_id` | ID of the option with the highest logit. |
+| `logits` | Raw logits for the option label tokens. |
+| `probabilities` | Softmax computed only over the listed option logits. |
+| `input_tokens`, `elapsed_seconds` | Prompt token count and processing time for the decision. |
+| `prompt_sha256`, `model` | Prompt hash and model identifier, including the checkpoint revision when available. |
 
-`probabilities`는 **정답 확률이나 보정된 신뢰도**가 아닙니다. 실제 평가에서 정답 선택지가 없는 긍정 리뷰를 모델이 `중립`으로 잘못 골랐고, 그 선택지 내부 확률은 0.9999 이상이었습니다.
+`probabilities` are **not probabilities of correctness or calibrated confidence**. In an evaluation where the correct sentiment was absent from the options, the model incorrectly classified a positive review as neutral with a conditional probability above 0.9999.
 
-후보의 `id`는 모델 프롬프트에 넣지 않고 결과 매핑에만 사용합니다. 모델이 읽는 것은 `description`과 그 앞에 붙인 선택지 문자입니다. 같은 설명과 순서를 유지한 채 ID만 바꿔도 모델 입력은 같습니다.
+In the core decision API, option IDs are used only to map results and are not included in the prompt. The model sees each description and its option label. Changing IDs while preserving descriptions and order leaves the model input unchanged. The System One API described below includes IDs in the option descriptions it constructs.
 
 ## Python API
 
@@ -67,21 +67,21 @@ engine = DecisionEngine.from_pretrained(
     "google/gemma-4-E2B-it", device="cpu", dtype="bfloat16"
 )
 result = engine.decide(Decision(
-    state="비밀번호 재설정 후에도 계정이 잠겨 있다.",
-    question="어느 팀으로 보내야 하나?",
+    state="The account is still locked after a password reset.",
+    question="Which team should handle this?",
     options=(
-        Option("account", "계정 접근 지원"),
-        Option("billing", "결제 지원"),
+        Option("account", "Account access support"),
+        Option("billing", "Billing support"),
     ),
 ))
 print(result.selected_id, result.logits, result.elapsed_seconds)
 ```
 
-`DecisionEngine`은 선택지 logit을 반환하는 백엔드와 프롬프트·결과 매핑을 분리합니다. `from_pretrained`는 Hugging Face 백엔드를 로드하고, 같은 API에 호환 모델의 ID나 로컬 경로를 지정할 수 있습니다. 다른 런타임을 붙일 때는 `LogitBackend` 프로토콜의 `tokenizer`, `model_name`, `selected_logits(input_ids, answer_token_ids)`를 구현해 `DecisionEngine(backend)`에 전달하면 됩니다.
+`DecisionEngine` separates prompt construction and result mapping from the backend that returns option logits. `from_pretrained` loads the Hugging Face backend and accepts a compatible model ID or local path. To use another runtime, implement the `LogitBackend` protocol with `tokenizer`, `model_name`, and `selected_logits(input_ids, answer_token_ids)`, then pass it to `DecisionEngine(backend)`.
 
 ## System One API
 
-HTTP 배포에는 System One 요청과 응답 형식의 `POST /v1/systemone`, `GET /v1/models`를 사용합니다. LLM이 API를 바로 적용할 수 있는 Markdown 문서는 `GET /.skill`에서 제공합니다. 서버는 기본적으로 로컬 주소 `127.0.0.1:8000`에서 실행합니다.
+The HTTP server exposes `POST /v1/systemone` and `GET /v1/models` using System One request and response formats. `GET /.skill` serves Markdown instructions that an LLM can use to call the API. The server binds to `127.0.0.1:8000` by default.
 
 ```powershell
 uv sync --locked --extra hf --extra serve
@@ -91,69 +91,77 @@ $env:OEV_MAX_CONCURRENCY = "4"
 uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device hybrid-cuda --dtype bfloat16
 ```
 
-`OEV_HOST`, `OEV_PORT`, `OEV_MAX_CONCURRENCY`의 기본값은 각각 `127.0.0.1`, `8000`, `4`입니다. `--host`, `--port`, `--max-concurrency` 인자가 환경변수보다 우선합니다. 한 서버 프로세스가 모델을 한 번 로드하며, 동시에 최대 4번의 모델 추론을 허용합니다. 한 요청 안의 여러 질문은 차례로 실행하고, 한도를 넘는 요청은 기다립니다. 동시 추론은 처리 속도 향상을 보장하지 않으며 입력 길이에 따라 GPU 메모리 사용량이 늘어날 수 있습니다.
+`OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads the model once and allows up to four simultaneous inferences by default. Questions within one request run sequentially, and requests wait when the concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length.
 
-장치 기본값은 `auto`입니다. 위 예시는 6GB CUDA GPU용으로 `hybrid-cuda`를 명시했습니다. 이 모드는 Gemma 4와 bfloat16 지원 CUDA GPU에만 적용됩니다.
+The default device is `auto`. The example explicitly selects `hybrid-cuda` for a 6 GB CUDA GPU. This mode requires Gemma 4 and a CUDA GPU with bfloat16 support.
 
 ```json
 {
   "model": "google/gemma-4-E2B-it",
-  "state": {"message": "환불 요청입니다"},
+  "state": {"message": "I would like a refund."},
   "questions": {
-    "route": {"type": "choice", "instructions": "어느 팀으로 보낼까?", "criteria": {"billing": "결제팀", "support": "고객지원팀"}},
-    "urgent": {"type": "noul", "instructions": "긴급 처리해야 하나?"},
-    "priority": {"type": "score", "instructions": "긴급도는?", "criteria": ["대기 가능", "이번 주", "오늘"]}
+    "route": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"billing": "Billing team", "support": "Customer support team"}},
+    "urgent": {"type": "noul", "instructions": "Does this require urgent action?"},
+    "priority": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "This week", "Today"]}
   }
 }
 ```
 
-공식 Python SDK에서는 `base_url="http://127.0.0.1:8000"`과 위의 `model` 이름을 지정하면 됩니다. 로컬 서버는 API 키를 검사하지 않지만 SDK 생성자에는 임의의 로컬 키를 전달할 수 있습니다.
+When using the System One Python SDK, set `base_url="http://127.0.0.1:8000"` and use the model name served by the API. The local server does not validate API keys, but you can supply an arbitrary local key if the SDK constructor requires one.
 
-요청의 모든 질문은 같은 `state`를 사용하며 oev는 질문마다 모델을 한 번 실행합니다. `choice`와 `score`는 최대 36개 선택지 또는 수준을 받습니다. `noul`은 `false`와 `true` 두 선택지의 확률을 계산해 `p(true)`를 반환합니다. `score`는 수준 번호의 확률 가중평균을 반환합니다. 한 선택지 또는 한 수준만 있으면 모델 실행 없이 결정합니다.
+All questions in a request share the same `state`, and oev runs the model once per question. `choice` and `score` accept up to 36 options or levels. `noul` evaluates `false` and `true` and returns `p(true)`. `score` returns the probability-weighted average of the level indices. A single option or level produces a deterministic result without running the model.
 
-`confidence`는 확률 분포의 집중도를 요약한 값입니다. `choice`는 `(최대 확률 − 1/K) / (1 − 1/K)`, `score`는 최빈 수준까지의 평균 거리를 사용합니다. oev의 확률과 confidence는 보정된 정답 확률이 아니므로 자동 처리 임계값은 실제 사용 데이터에서 검증해야 합니다. `usage.input_tokens`는 질문별 입력 토큰 수의 합계이며, 토큰을 생성하지 않아 `usage.output_tokens`는 0입니다. 기본 서버는 인증을 제공하지 않으므로 외부에 공개할 때는 인증과 TLS를 앞단에 구성해야 합니다.
+`confidence` summarizes how concentrated the probability distribution is. For `choice`, it uses `(max probability − 1/K) / (1 − 1/K)`; for `score`, it uses the average distance from the most probable level. These values are not calibrated probabilities of correctness, so thresholds for automated actions should be validated on actual application data. `usage.input_tokens` sums the prompt tokens across questions, and `usage.output_tokens` is zero because no tokens are generated. The default server provides no authentication; use authentication and TLS in front of it when exposing it externally.
 
-## 계산 방식과 범위
+## Computation and limits
 
-Gemma 4 백엔드는 마지막 은닉 상태를 **선택지 토큰에 해당하는 출력 가중치 행에만** 투영합니다. 전체 어휘에 대한 최종 logit 투영을 생략하지만, 입력 프롬프트에 대한 모델 forward 자체는 수행합니다. 다른 호환 모델은 지원되는 경우 `logits_to_keep=1`로 마지막 위치만 계산한 뒤 선택지 logit을 읽습니다.
+The Gemma 4 backend projects the final hidden state **only onto output weight rows corresponding to the option tokens**. It skips the final projection over the full vocabulary but still performs the model forward pass over the input prompt. For other compatible models, it uses `logits_to_keep=1` when supported to compute only the last position before reading the option logits.
 
-선택지 문자 하나가 정확히 한 토큰인지, 프롬프트 끝에서 토큰이 합쳐지지 않는지 실행 전에 검사합니다. 조건을 만족하지 않으면 오류를 냅니다. 입력은 자동으로 자르지 않으며 기본 한도는 4096토큰입니다. 순서대로 한 문항씩 실행하고, 한 파일 안에서는 모델을 한 번 로드해 재사용합니다. SemIf의 prefix cache 최적화는 아직 구현하지 않았습니다.
+Before inference, oev checks that each label is exactly one token and does not merge with the end of the prompt. It raises an error if either condition fails. Input is never truncated automatically; the default limit is 4,096 tokens. File processing runs one decision at a time and reuses the loaded model. SemIf's prefix cache optimization is not implemented yet.
 
-## 평가 재현
+## Reproducing evaluations
 
-기존 평가 결과와 보고서는 대문자 선택지로 실행한 기록입니다. 현재의 소문자·숫자 선택지에 대한 정확도는 별도 평가가 필요합니다. 기존 평가 스크립트와 파일의 대문자 표기는 선택지 위치를 나타내는 메타데이터로 유지합니다.
+The original E2B evaluation results and reports used uppercase option labels. Their scripts and fixtures retain uppercase labels as position metadata. The newer [E4B HTTP evaluation](reports/macstudio-e4b-stress-shuffles-20261001.md) used the current lowercase labels and matched the expected answer in all 220 permutation cases, with a median HTTP response time of 0.355 seconds. That set contains 2–20 options per case; it does not evaluate 36-option accuracy.
 
-현재 CPU 결과와 선택지별 logit은 [기본 13문항 보고서](reports/gemma4-e2b-cpu.md)와 [스트레스 평가 요약](reports/gemma4-e2b-stress-summary.md)에 있습니다. 6GB GPU와 CPU RAM을 함께 사용한 실행 결과는 [GPU 하이브리드 16문항 보고서](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)에 있습니다. 직접 만든 소규모 문항이므로 결과 비율을 일반적인 정확도로 해석하면 안 됩니다.
+CPU results and per-option logits are available in the [13-case baseline report](reports/gemma4-e2b-cpu.md) and [stress evaluation summary](reports/gemma4-e2b-stress-summary.md). The [16-case GPU hybrid report](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md) covers execution using a 6 GB GPU together with CPU RAM. These are small, manually constructed datasets; their accuracy rates should not be treated as general performance estimates.
 
-스트레스 평가의 원본 문항은 `examples/stress-challenges.jsonl`과 `examples/stress-semantic20-hard.jsonl`에 있습니다. 아래 명령은 기존 11문항을 20회씩 순서 변경한 220건과 후속 문항을 고정 시드로 생성합니다.
+The original stress cases are in `examples/stress-challenges.jsonl` and `examples/stress-semantic20-hard.jsonl`. The following command uses a fixed seed to generate 20 option permutations for each of 11 base cases, producing 220 cases plus follow-up cases.
 
-평가 파일의 `expected_id`, `expected_letter`, `scenario`는 채점용 메타데이터입니다. `oev` 추론에는 `state`, `question`, `options`만 사용합니다.
+The `expected_id`, `expected_letter`, and `scenario` fields are scoring metadata. Core oev inference uses only `state`, `question`, and `options`.
 
 ```powershell
 uv run --locked --extra hf python scripts/build_stress_suite.py
 ```
 
-16개 주요 스트레스 문항을 실행하고 채점하려면:
+To run and score the 16 main stress cases:
 
 ```powershell
 uv run --locked --extra hf oev --model google/gemma-4-E2B-it --device cpu --dtype bfloat16 --input examples/stress-challenges.jsonl --output results/gemma4-e2b-stress-challenges-cpu.jsonl
 uv run --locked --extra hf python scripts/score_stress.py --input examples/stress-challenges.jsonl --output results/gemma4-e2b-stress-challenges-cpu.jsonl --report reports/gemma4-e2b-stress-challenges-cpu.md --details
 ```
 
-`--details`는 보고서에 각 문항의 모든 선택지 logit을 넣습니다. 채점 스크립트는 실행 도중의 일부 결과 파일도 읽어 완료 건수와 현재 정답 수를 보여줍니다. 기존 CPU 실행에서는 이 16건 중 15건이 기대 답과 일치했습니다.
+`--details` includes every option's logit in the report. The scoring script can also read partial output files during a run and report the completed and correct counts. In the recorded CPU run, 15 of these 16 cases matched the expected answer.
 
-순서 변경 220건 중 CPU에서 완료한 것은 중복 청구 한 문항의 서로 다른 순서 20건입니다. 전체 220건을 GPU에서 실행하려면:
+The original CPU permutation run completed 20 different orders of the duplicate-charge case. To run the full 220-case set locally on a GPU:
 
 ```powershell
 uv run --locked --extra hf oev --model google/gemma-4-E2B-it --device cuda --dtype bfloat16 --input examples/stress-shuffles.jsonl --output results/gemma4-e2b-stress-shuffles-gpu.jsonl
 uv run --locked --extra hf python scripts/score_stress.py --input examples/stress-shuffles.jsonl --output results/gemma4-e2b-stress-shuffles-gpu.jsonl --report reports/gemma4-e2b-stress-shuffles-gpu.md
 ```
 
-이 명령에는 CUDA용 PyTorch와 bfloat16을 지원하는 GPU가 필요합니다. 2개 또는 3개 선택지 문항은 가능한 순서가 20가지보다 적어 일부 입력이 반복됩니다. 4개 선택지 문항은 서로 다른 순서 20개이고, 20개 선택지 문항은 정답이 A–T 각 위치에 한 번씩 놓입니다. 복합 의도 문항에는 우선순위나 수동 분리 기준을 명시해 기대 답을 하나로 정했습니다.
+These commands require CUDA-enabled PyTorch and a GPU with bfloat16 support. Cases with two or three options have fewer than 20 possible permutations, so some inputs repeat. Four-option cases use 20 distinct orders, and 20-option cases place the correct answer once at each position. Cases with multiple intents specify a priority or manual triage rule to define one expected answer.
 
-## 검증
+## HTTP benchmark
+
+To run the 220-case permutation evaluation against a running System One server, use the command below. Replace the base URL with your server address. The `test` extra provides `httpx`. The benchmark excludes three warm-up requests, reuses the connection, and sends requests sequentially. It records accuracy and median/p95 response times, including network time. Output files are not overwritten; use new paths for each run. The server API includes option IDs in the model input, so its prompts differ from the local evaluation prompts.
 
 ```powershell
-uv run --locked --extra hf --extra test pytest -q
+uv run --locked --extra test python scripts/benchmark_systemone.py --base-url http://macstudio:12821 --input examples/stress-shuffles.jsonl --output results/http-shuffles.jsonl --report reports/http-shuffles.md
+```
+
+## Validation
+
+```powershell
+uv run --locked --extra hf --extra serve --extra test pytest -q
 uv lock --check
 ```
