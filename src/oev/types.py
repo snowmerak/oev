@@ -8,7 +8,7 @@ import math
 from typing import Any
 
 
-MAX_OPTIONS = 25
+MAX_OPTIONS = 36
 
 
 @dataclass(frozen=True)

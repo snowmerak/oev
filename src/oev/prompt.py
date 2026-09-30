@@ -8,10 +8,11 @@ from typing import Protocol
 
 from .types import Decision, MAX_OPTIONS
 
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:MAX_OPTIONS]
+LETTERS = "abcdefghijklmnopqrstuvwxyz0123456789"[:MAX_OPTIONS]
 SYSTEM_PROMPT = (
     "Apply the question to the supplied state. Choose exactly one listed option. "
-    "Reply with only its uppercase letter, without explanation or reasoning."
+    "Reply with only its label (a lowercase letter a-z or a digit 0-9), "
+    "without explanation or reasoning."
 )
 
 
@@ -46,10 +47,10 @@ def prepare(tokenizer: Tokenizer, decision: Decision, max_input_tokens: int) -> 
     for letter in LETTERS[: len(decision.options)]:
         token_ids = tokenizer.encode(letter, add_special_tokens=False)
         if len(token_ids) != 1 or tokenizer.decode(token_ids) != letter:
-            raise ValueError(f"answer letter {letter!r} is not one exact token for this tokenizer")
+            raise ValueError(f"answer label {letter!r} is not one exact token for this tokenizer")
         if tokenizer.encode(prompt + letter, add_special_tokens=False) != ids + token_ids:
-            raise ValueError(f"answer letter {letter!r} merges with the prompt boundary")
+            raise ValueError(f"answer label {letter!r} merges with the prompt boundary")
         slots.append(token_ids[0])
     if len(slots) != len(set(slots)):
-        raise ValueError("answer letters map to duplicate token ids")
+        raise ValueError("answer labels map to duplicate token ids")
     return ids, slots, hashlib.sha256(prompt.encode("utf-8")).hexdigest()

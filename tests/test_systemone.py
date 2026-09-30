@@ -97,16 +97,45 @@ def test_systemone_evaluates_all_question_types_and_preserves_meanings():
     assert '"Level 1: {\\"level\\": \\"Soon\\"}"' in backend.prompts[2]
 
 
-def test_twenty_five_options_reach_y_and_twenty_six_are_rejected():
-    backend = FixedBackend([[0.0] * 24 + [3.0]])
+@pytest.mark.parametrize(("count", "last_label"), [(26, "z"), (27, "0"), (36, "9")])
+def test_option_labels_cover_lowercase_letters_and_digits(count, last_label):
+    backend = FixedBackend([[0.0] * (count - 1) + [3.0]])
     engine = DecisionEngine(backend, max_input_tokens=100_000)
-    options = tuple(Option(str(index), f"option {index}") for index in range(25))
+    options = tuple(Option(str(index), f"option {index}") for index in range(count))
     result = engine.decide(Decision("state", "question", options))
-    assert result.selected_id == "24"
-    assert backend.answer_slots[0][-1] == ord("Y")
+    assert result.selected_id == str(count - 1)
+    assert len(backend.answer_slots) == 1
+    assert backend.answer_slots[0] == list(map(ord, "abcdefghijklmnopqrstuvwxyz0123456789"[:count]))
+    assert f'"letter": "{last_label}"' in backend.prompts[0]
+    assert sum(result.probabilities.values()) == pytest.approx(1.0)
 
-    with pytest.raises(ValueError, match="2 to 25"):
-        Decision("state", "question", options + (Option("25", "option 25"),))
+
+def test_thirty_seven_options_are_rejected():
+    options = tuple(Option(str(index), f"option {index}") for index in range(37))
+    with pytest.raises(ValueError, match="2 to 36"):
+        Decision("state", "question", options)
+
+
+@pytest.mark.parametrize("kind", ["choice", "score"])
+def test_http_accepts_thirty_six_criteria_and_rejects_thirty_seven(kind):
+    service, backend = service_for([[0.0] * 35 + [100.0]])
+    client = TestClient(create_app(service))
+    criteria = {str(index): f"option {index}" for index in range(36)}
+    question = {"type": kind, "criteria": criteria if kind == "choice" else list(criteria.values())}
+    request = {"model": "oev-test", "state": "state", "questions": {"result": question}}
+    response = client.post("/v1/systemone", json=request)
+    assert response.status_code == 200
+    answer = response.json()["answers"]["result"]
+    assert len(answer["probabilities"]) == 36
+    if kind == "choice":
+        assert answer["choice"] == "35"
+        question["criteria"]["36"] = "extra option"
+    else:
+        assert answer["score"] == pytest.approx(35.0)
+        question["criteria"].append("extra level")
+    assert backend.answer_slots[0][-1] == ord("9")
+    assert client.post("/v1/systemone", json=request).status_code == 422
+    assert len(backend.prompts) == 1
 
 
 def test_http_contract_and_validation_before_inference():
@@ -151,7 +180,7 @@ def test_http_contract_and_validation_before_inference():
             "route": request["questions"]["route"],
             "too_many": {
                 "type": "score",
-                "criteria": [str(index) for index in range(26)],
+                "criteria": [str(index) for index in range(37)],
             },
         },
     }

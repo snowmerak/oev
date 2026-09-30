@@ -37,7 +37,7 @@ GET /v1/models
   "models": [
     {
       "name": "google/gemma-4-E2B-it",
-      "description": "oev System One: choice, noul, score; up to 25 choices or levels. Probabilities are conditional on listed options and are not calibrated.",
+      "description": "oev System One: choice, noul, score; up to 36 choices or levels. Probabilities are conditional on listed options and are not calibrated.",
       "release_date": "2026-09-23"
     }
   ]
@@ -131,7 +131,7 @@ Each question has a `type`, optional `instructions`, and type-specific `criteria
 
 ### `choice`
 
-Use `criteria` as an object with 1 to 25 entries. Each key is a nonempty option identifier and each value is a string, object, array, or `null` description. The returned `choice` is exactly one of those keys. The model sees both the key and its description, so use short, meaningful keys and descriptions that state the distinction.
+Use `criteria` as an object with 1 to 36 entries. Each key is a nonempty option identifier and each value is a string, object, array, or `null` description. The returned `choice` is exactly one of those keys. The model sees both the key and its description, so use short, meaningful keys and descriptions that state the distinction.
 
 ```json
 {
@@ -165,7 +165,7 @@ The returned `noul` is the conditional probability assigned to `true`, from `0.0
 
 ### `score`
 
-Use `criteria` as an ordered array of 1 to 25 non-null levels, from lowest at index `0` to highest at index `N-1`. Each level may be a string, object, or array.
+Use `criteria` as an ordered array of 1 to 36 non-null levels, from lowest at index `0` to highest at index `N-1`. Each level may be a string, object, or array.
 
 ```json
 {

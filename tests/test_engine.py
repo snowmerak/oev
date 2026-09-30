@@ -48,7 +48,7 @@ def test_one_readout_maps_scores_to_runtime_options():
     assert result.logits == {"account": 0.0, "billing": 2.0, "other": -1.0}
     assert math.isclose(sum(result.probabilities.values()), 1.0)
     assert len(backend.calls) == 1
-    assert backend.calls[0][1] == [ord("A"), ord("B"), ord("C")]
+    assert backend.calls[0][1] == [ord("a"), ord("b"), ord("c")]
     assert result.input_tokens == len(backend.calls[0][0])
     assert len(result.prompt_sha256) == 64
 
@@ -56,7 +56,7 @@ def test_one_readout_maps_scores_to_runtime_options():
 def test_rejects_ambiguous_answer_tokenization():
     class MergingTokenizer(CharacterTokenizer):
         def encode(self, text, add_special_tokens=False):
-            if text.endswith("ANSWER: A"):
+            if text.endswith("ANSWER: a"):
                 return super().encode(text[:-1])[:-1] + [999]
             return super().encode(text)
 

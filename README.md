@@ -1,6 +1,6 @@
 # oev
 
-`oev`는 언어 모델로 여러 선택지 중 하나를 고르는 작은 Python 라이브러리입니다. `state`, `question`, `options`를 프롬프트로 만들고 모델을 한 번 실행한 뒤, 다음 토큰 위치에서 선택지 문자 `A`–`Y`의 logit을 읽습니다. 답변 문장이나 JSON을 생성하지 않습니다. [SemIf](https://github.com/TheoLeeCJ/SemIf)의 직접 logit 판독 방식을 참고했습니다.
+`oev`는 언어 모델로 여러 선택지 중 하나를 고르는 작은 Python 라이브러리입니다. `state`, `question`, `options`를 프롬프트로 만들고 모델을 한 번 실행한 뒤, 다음 토큰 위치에서 선택지 문자 `a`–`z`, `0`–`9`의 logit을 읽습니다. 답변 문장이나 JSON을 생성하지 않습니다. [SemIf](https://github.com/TheoLeeCJ/SemIf)의 직접 logit 판독 방식을 참고했습니다.
 
 기본 모델은 `google/gemma-4-E2B-it`입니다. `--model`에 다른 Hugging Face causal LM의 모델 ID 또는 Transformers 형식의 로컬 체크포인트 경로를 넣을 수 있습니다. GGUF 파일은 현재 지원하지 않습니다.
 
@@ -42,7 +42,7 @@ uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --dev
 | `id` | 결과를 연결할 기록 ID. 생략하면 파일의 문항 순번을 사용합니다. |
 | `state` | 판단에 필요한 문자열, JSON 객체 또는 배열. |
 | `question` | 선택 기준을 설명하는 문장. |
-| `options` | 2–25개의 `{ "id", "description" }` 객체. 순서대로 A–Y에 대응합니다. |
+| `options` | 2–36개의 `{ "id", "description" }` 객체. 순서대로 `a`–`z`, `0`–`9`에 대응합니다. |
 
 결과도 JSONL로 쓰며, 핵심 필드는 다음과 같습니다.
 
@@ -109,7 +109,7 @@ uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it
 
 공식 Python SDK에서는 `base_url="http://127.0.0.1:8000"`과 위의 `model` 이름을 지정하면 됩니다. 로컬 서버는 API 키를 검사하지 않지만 SDK 생성자에는 임의의 로컬 키를 전달할 수 있습니다.
 
-요청의 모든 질문은 같은 `state`를 사용하며 oev는 질문마다 모델을 한 번 실행합니다. `choice`와 `score`는 최대 25개 선택지 또는 수준을 받습니다. `noul`은 `false`와 `true` 두 선택지의 확률을 계산해 `p(true)`를 반환합니다. `score`는 수준 번호의 확률 가중평균을 반환합니다. 한 선택지 또는 한 수준만 있으면 모델 실행 없이 결정합니다.
+요청의 모든 질문은 같은 `state`를 사용하며 oev는 질문마다 모델을 한 번 실행합니다. `choice`와 `score`는 최대 36개 선택지 또는 수준을 받습니다. `noul`은 `false`와 `true` 두 선택지의 확률을 계산해 `p(true)`를 반환합니다. `score`는 수준 번호의 확률 가중평균을 반환합니다. 한 선택지 또는 한 수준만 있으면 모델 실행 없이 결정합니다.
 
 `confidence`는 확률 분포의 집중도를 요약한 값입니다. `choice`는 `(최대 확률 − 1/K) / (1 − 1/K)`, `score`는 최빈 수준까지의 평균 거리를 사용합니다. oev의 확률과 confidence는 보정된 정답 확률이 아니므로 자동 처리 임계값은 실제 사용 데이터에서 검증해야 합니다. `usage.input_tokens`는 질문별 입력 토큰 수의 합계이며, 토큰을 생성하지 않아 `usage.output_tokens`는 0입니다. 기본 서버는 인증을 제공하지 않으므로 외부에 공개할 때는 인증과 TLS를 앞단에 구성해야 합니다.
 
@@ -120,6 +120,8 @@ Gemma 4 백엔드는 마지막 은닉 상태를 **선택지 토큰에 해당하�
 선택지 문자 하나가 정확히 한 토큰인지, 프롬프트 끝에서 토큰이 합쳐지지 않는지 실행 전에 검사합니다. 조건을 만족하지 않으면 오류를 냅니다. 입력은 자동으로 자르지 않으며 기본 한도는 4096토큰입니다. 순서대로 한 문항씩 실행하고, 한 파일 안에서는 모델을 한 번 로드해 재사용합니다. SemIf의 prefix cache 최적화는 아직 구현하지 않았습니다.
 
 ## 평가 재현
+
+기존 평가 결과와 보고서는 대문자 선택지로 실행한 기록입니다. 현재의 소문자·숫자 선택지에 대한 정확도는 별도 평가가 필요합니다. 기존 평가 스크립트와 파일의 대문자 표기는 선택지 위치를 나타내는 메타데이터로 유지합니다.
 
 현재 CPU 결과와 선택지별 logit은 [기본 13문항 보고서](reports/gemma4-e2b-cpu.md)와 [스트레스 평가 요약](reports/gemma4-e2b-stress-summary.md)에 있습니다. 6GB GPU와 CPU RAM을 함께 사용한 실행 결과는 [GPU 하이브리드 16문항 보고서](reports/gemma4-e2b-stress-challenges-gpu-hybrid.md)에 있습니다. 직접 만든 소규모 문항이므로 결과 비율을 일반적인 정확도로 해석하면 안 됩니다.
 
