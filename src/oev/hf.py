@@ -68,7 +68,9 @@ class HuggingFaceBackend:
         if self._keep_last_only:
             kwargs["logits_to_keep"] = 1
         with torch.inference_mode():
-            if self._selective_gemma4:
+            # Compressed-tensors decompresses packed weights in a root pre-hook
+            # on the first forward. Calling only the decoder would bypass it.
+            if self._selective_gemma4 and not self.model._forward_pre_hooks:
                 kwargs.pop("logits_to_keep", None)
                 hidden = self.model.model(**kwargs).last_hidden_state[:, -1, :]
                 slots = torch.tensor(answer_token_ids, dtype=torch.long, device=device)

@@ -21,6 +21,15 @@ uv run --locked --extra hf oev --model HuggingFaceTB/SmolLM2-135M-Instruct --dev
 
 This small model is intended for smoke tests. Its classification quality does not represent Gemma 4 E2B. `uv.lock` selects a PyTorch distribution based on the operating system.
 
+Compressed-tensors QAT checkpoints also require the `qat` extra:
+
+```powershell
+uv sync --locked --extra hf --extra qat
+uv run --locked --extra hf --extra qat oev --model google/gemma-4-E4B-it-qat-w4a16-ct --revision 6cd26aaa2357fb2bad8c51699a7558a4d1a965bb --device cuda --dtype bfloat16 --input examples/decisions.jsonl --output results/qat-demo.jsonl
+```
+
+The installed Transformers/compressed-tensors runtime expands packed W4A16 weights for inference on the first forward pass. Checkpoint size therefore does not represent runtime GPU memory use. oev preserves the model's decompression hook for that first pass and can use selective output projection afterward.
+
 | Operating system | PyTorch distribution | Available `--device` values |
 | --- | --- | --- |
 | Windows | CUDA 13.0 build | `cuda`, `hybrid-cuda`, or `cpu` |

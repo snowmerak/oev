@@ -15,6 +15,9 @@ dependencies = []
 hf = ["torch>=2.6", "transformers>=5.0,<6", "accelerate>=1.0"]
 serve = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 test = ["pytest>=8.0", "httpx>=0.27"]
+qat = [
+    "compressed-tensors>=0.15,<0.17",
+]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]

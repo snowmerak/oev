@@ -58,6 +58,62 @@ def test_gemma4_last_position_optimization_matches_full_logits():
     assert backend.selected_logits(ids, slots) == pytest.approx(expected, abs=1e-6)
 
 
+def test_compressed_gemma4_runs_decompression_hook_before_selective_projection():
+    pytest.importorskip("compressed_tensors")
+    from compressed_tensors.compressors import ModelCompressor
+    from compressed_tensors.quantization import (
+        QuantizationArgs,
+        QuantizationConfig,
+        QuantizationScheme,
+        apply_quantization_config,
+    )
+
+    config = transformers.Gemma4TextConfig(
+        vocab_size=64, vocab_size_per_layer_input=64, hidden_size=32,
+        intermediate_size=64, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=16, hidden_size_per_layer_input=32,
+        max_position_embeddings=128, sliding_window=32,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+    model = transformers.Gemma4ForCausalLM(config).eval()
+    quantization = QuantizationConfig(
+        config_groups={
+            "weights": QuantizationScheme(
+                targets=["Linear"], format="pack-quantized",
+                weights=QuantizationArgs(
+                    num_bits=4, type="int", symmetric=True,
+                    strategy="group", group_size=32,
+                ),
+            )
+        },
+        ignore=["lm_head"], format="pack-quantized", quantization_status="frozen",
+    )
+    apply_quantization_config(model, quantization)
+    for module in model.modules():
+        if hasattr(module, "weight_scale"):
+            module.weight_scale.data.fill_(0.01)
+    ModelCompressor(quantization_config=quantization).compress_model(model)
+    assert hasattr(model, "ct_decompress_hook")
+    backend = HuggingFaceBackend(model, tokenizer=None, model_name="tiny-ct-gemma4")
+    ids, slots = [2, 4, 8, 12], [5, 7]
+
+    # The first call must reach the model's root hook, not its decoder directly.
+    actual = backend.selected_logits(ids, slots)
+    assert not hasattr(model, "ct_decompress_hook")
+    with torch.inference_mode():
+        expected = model(
+            input_ids=torch.tensor([ids]), use_cache=False, logits_to_keep=1,
+        ).logits[0, -1, slots].tolist()
+    assert actual == pytest.approx(expected, abs=1e-6)
+
+    # Once decompressed, subsequent calls can skip full-vocabulary projection.
+    def no_full_projection(*args, **kwargs):
+        raise AssertionError("full-vocabulary projection was called")
+
+    model.lm_head.forward = no_full_projection
+    assert backend.selected_logits(ids, slots) == pytest.approx(expected, abs=1e-6)
+
+
 def test_gemma4_checkpoint_class_uses_selective_projection_and_softcap():
     text_config = transformers.Gemma4TextConfig(
         vocab_size=64,
