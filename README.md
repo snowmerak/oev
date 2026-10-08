@@ -30,6 +30,12 @@ uv run --locked --extra hf --extra qat oev --model google/gemma-4-E4B-it-qat-w4a
 
 The installed Transformers/compressed-tensors runtime expands packed W4A16 weights for inference on the first forward pass. Checkpoint size therefore does not represent runtime GPU memory use. oev preserves the model's decompression hook for that first pass and can use selective output projection afterward.
 
+Gemma 4 12B QAT loads on the tested 6 GB Windows GPU, but its default whole-model decompression runs out of memory even with shared GPU memory. The experimental [CT probe](scripts/probe_ct_w4a16.py) keeps symmetric group-32 W4 weights packed and temporarily expands each Linear layer for BF16 computation. It uses ordinary BF16 matrix multiplication and leaves the default loader unchanged. The probe defaults to the tested 12B checkpoint and pinned revision; see the [12B execution report](reports/gemma4-12b-qat-w4a16-cuda-20261008.md).
+
+```powershell
+uv run --locked --extra hf --extra qat python scripts/probe_ct_w4a16.py --device cuda --input examples/decisions.jsonl --output results/12b-qat.jsonl --events results/12b-qat-events.jsonl
+```
+
 | Operating system | PyTorch distribution | Available `--device` values |
 | --- | --- | --- |
 | Windows | CUDA 13.0 build | `cuda`, `hybrid-cuda`, or `cpu` |
