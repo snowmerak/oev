@@ -1,4 +1,4 @@
-"""Serve the System One API with a local oev model."""
+"""Serve typed decisions and OpenAI-compatible text generation with one local model."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from .chat import add_chat_routes
 from .engine import DecisionEngine
 from .systemone import SystemOneService
 from .types import MAX_OPTIONS
@@ -90,10 +91,13 @@ class ModelMetadata(BaseModel):
 
 class ModelMetadataList(BaseModel):
     models: list[ModelMetadata]
+    object: Literal["list"] = "list"
+    data: list[dict[str, Any]]
 
 
 def create_app(service: SystemOneService) -> FastAPI:
-    app = FastAPI(title="oev System One", version="0.1.0")
+    app = FastAPI(title="oev decisions and chat", version="0.1.0")
+    add_chat_routes(app, service)
 
     @app.get("/.skill", response_class=PlainTextResponse, include_in_schema=False)
     def skill() -> PlainTextResponse:
@@ -101,7 +105,10 @@ def create_app(service: SystemOneService) -> FastAPI:
 
     @app.get("/v1/models", response_model=ModelMetadataList)
     def models() -> dict[str, Any]:
-        return service.models()
+        return {
+            **service.models(), "object": "list",
+            "data": [{"id": service.model, "object": "model", "created": 0, "owned_by": "oev"}],
+        }
 
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     def systemone(request: SystemOneRequest) -> dict[str, Any]:
@@ -116,7 +123,7 @@ def create_app(service: SystemOneService) -> FastAPI:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="google/gemma-4-E2B-it", help="Hugging Face model ID")
-    parser.add_argument("--served-model", help="Model name accepted by the System One API")
+    parser.add_argument("--served-model", help="Model name accepted by all APIs")
     parser.add_argument("--revision", help="Hugging Face commit revision")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")

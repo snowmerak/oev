@@ -149,6 +149,8 @@ def test_http_contract_and_validation_before_inference():
     assert "POST /v1/systemone" in skill.text
     assert "not a calibrated" in skill.text
     assert client.get("/v1/models").json() == {
+        "object": "list",
+        "data": [{"id": "oev-test", "object": "model", "created": 0, "owned_by": "oev"}],
         "models": [
             {
                 "name": "oev-test",

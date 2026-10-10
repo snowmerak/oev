@@ -8,19 +8,21 @@ transformers = pytest.importorskip("transformers")
 
 from oev.hf import HuggingFaceBackend
 from oev.hybrid import HybridGemma4Backend
+from oev.generation import GenerationOptions
 
 
 IDS = [2, 4, 8, 12]
 SLOTS = [5, 7]
 
 
-def gemma4_model():
+def gemma4_model(shared=False):
     text = transformers.Gemma4TextConfig(
         vocab_size=64, vocab_size_per_layer_input=64, hidden_size=32,
-        intermediate_size=64, num_hidden_layers=2, num_attention_heads=2,
+        intermediate_size=64, num_hidden_layers=4 if shared else 2, num_attention_heads=2,
         num_key_value_heads=1, head_dim=16, hidden_size_per_layer_input=32,
-        max_position_embeddings=128, sliding_window=32,
-        layer_types=["sliding_attention", "full_attention"],
+        max_position_embeddings=128, sliding_window=4 if shared else 32,
+        num_kv_shared_layers=2 if shared else 0,
+        layer_types=["sliding_attention", "full_attention"] * (2 if shared else 1),
         final_logit_softcapping=2.0,
     )
     vision = transformers.Gemma4VisionConfig(
@@ -209,3 +211,95 @@ def test_hybrid_cuda_logits_match_cpu_full_projection(quantized):
     assert next(backend.text_model.layers.parameters()).device.type == "cuda"
     for _ in range(2):
         assert backend.selected_logits(IDS, SLOTS) == pytest.approx(expected, abs=0.005)
+
+
+@pytest.mark.parametrize("kind", ["gpt2", "gemma4", "gemma4-shared", "unified"])
+def test_cached_generation_matches_transformers_and_reuses_decision_model(kind):
+    if kind == "gpt2":
+        model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
+            vocab_size=64, n_positions=128, n_ctx=128, n_embd=32, n_layer=1,
+            n_head=2, eos_token_id=63, pad_token_id=0,
+        )).eval()
+    elif kind in {"gemma4", "gemma4-shared"}:
+        model = gemma4_model(shared=kind == "gemma4-shared")
+    else:
+        model = unified_model("Gemma4UnifiedForConditionalGeneration")
+    options = GenerationOptions(max_new_tokens=4)
+    with torch.inference_mode():
+        expected = model.generate(
+            input_ids=torch.tensor([IDS]), attention_mask=torch.ones((1, len(IDS)), dtype=torch.long),
+            do_sample=False, max_new_tokens=4, pad_token_id=0,
+        )[0, len(IDS):].tolist()
+    backend = HuggingFaceBackend(model, tokenizer=None, model_name="tiny-shared")
+    steps = []
+    handle = model.register_forward_pre_hook(lambda module, args, kwargs: steps.append(
+        (kwargs["input_ids"].shape[1], kwargs.get("past_key_values")),
+    ), with_kwargs=True)
+    for _ in range(2):
+        start = len(steps)
+        assert list(backend.generate_tokens(IDS, options, Event())) == expected
+        assert steps[start] == (len(IDS), None)
+        assert all(length == 1 and cache is not None for length, cache in steps[start + 1:])
+    handle.remove()
+    assert backend.model is model
+    assert backend.selected_logits(IDS, SLOTS) == pytest.approx(full_logits(model), abs=1e-6)
+    # Closing a token iterator must not leave thread-local inference mode on.
+    stream = backend.generate_tokens(IDS, options, Event())
+    next(stream)
+    assert not torch.is_inference_mode_enabled()
+    stream.close()
+
+
+def test_ct_first_generation_and_decision_share_initialization_lock(monkeypatch):
+    model = unified_model("Gemma4UnifiedForConditionalGeneration")
+    compressor = compress(model)
+    backend = HuggingFaceBackend(model, tokenizer=None, model_name="tiny-ct-shared")
+    entered, release, competing = Event(), Event(), Event()
+    original = compressor.decompress_model
+    calls = 0
+
+    def delayed(model):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            competing.set()
+        entered.set()
+        assert release.wait(timeout=10)
+        return original(model)
+
+    monkeypatch.setattr(compressor, "decompress_model", delayed)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        generation = pool.submit(lambda: list(backend.generate_tokens(IDS, GenerationOptions(4), Event())))
+        try:
+            assert entered.wait(timeout=10)
+            decision = pool.submit(backend.selected_logits, IDS, SLOTS)
+            assert not competing.wait(timeout=0.1)
+        finally:
+            release.set()
+        assert generation.result(timeout=10)
+        assert decision.result(timeout=10) == pytest.approx(full_logits(model), abs=1e-6)
+    assert calls == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="requires CUDA with bfloat16 support",
+)
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+def test_hybrid_cached_generation_matches_cpu_and_still_supports_selection(quantized, shared):
+    model = gemma4_model(shared=shared).to(torch.bfloat16)
+    if quantized:
+        compress(model)
+        reference = gemma4_model(shared=shared).to(torch.bfloat16)
+        compress(reference)
+        reference.load_state_dict(model.state_dict())
+    else:
+        reference = model
+    options = GenerationOptions(4)
+    expected = list(HuggingFaceBackend(reference, None, "cpu").generate_tokens(IDS, options, Event()))
+    expected_scores = full_logits(reference)
+    backend = HybridGemma4Backend(model, None, "hybrid")
+    for _ in range(2):
+        assert list(backend.generate_tokens(IDS, options, Event())) == expected
+    assert backend.selected_logits(IDS, SLOTS) == pytest.approx(expected_scores, abs=0.005)

@@ -103,3 +103,26 @@ class HuggingFaceBackend:
         elif device.type == "mps":
             torch.mps.synchronize()
         return selected
+
+    def generate_tokens(self, input_ids, options, cancel):
+        from .generation import sample_tokens
+
+        return sample_tokens(self._generation_step, self.model, input_ids, options, cancel)
+
+    def _generation_step(self, input_ids, cache, sequence_length):
+        import torch
+
+        device = next(self.model.parameters()).device
+        kwargs = {
+            "input_ids": torch.tensor([input_ids], dtype=torch.long, device=device),
+            "attention_mask": torch.ones((1, sequence_length), dtype=torch.long, device=device),
+            "past_key_values": cache,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if self._keep_last_only:
+            kwargs["logits_to_keep"] = 1
+        initialization = self._decompression_lock if hasattr(self.model, "ct_decompress_hook") else nullcontext()
+        with initialization:
+            output = self.model(**kwargs)
+        return output.logits[0, -1], output.past_key_values

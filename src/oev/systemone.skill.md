@@ -26,6 +26,8 @@ Do not use it for open-ended generation, fact retrieval, tool execution, or cali
 
 Use the same origin that served this document. The built-in local server does not require an API key, though a deployment proxy may add authentication.
 
+For open-ended text, this server also exposes `POST /v1/responses` and `POST /v1/chat/completions`, using the same loaded model. Both support text messages and SSE streaming. Responses accepts `model`, `input`, optional `instructions`, and `max_output_tokens`; Chat Completions accepts `model`, `messages`, and `max_completion_tokens`. Generation is stateless, so resend conversation history. Tools, images/audio, and structured-output constraints are unsupported. `GET /v1/models` also returns an OpenAI-compatible `data` array; the existing `models` array below remains available. Generation validation uses HTTP `400`; System One uses HTTP `422`.
+
 ## Discover the model
 
 ```http

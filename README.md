@@ -1,6 +1,6 @@
 # oev
 
-`oev` is a small Python library for choosing one option with a language model. It builds a prompt from `state`, `question`, and `options`, runs the model once, and reads the next-token logits for option labels `a`–`z` and `0`–`9`. It does not generate an answer sentence or JSON. The direct logit readout approach is inspired by [SemIf](https://github.com/TheoLeeCJ/SemIf).
+`oev` is a small Python library for choosing one option with a language model. Its decision path builds a prompt from `state`, `question`, and `options`, runs the model once, and reads the next-token logits for option labels `a`–`z` and `0`–`9`. The direct logit readout approach is inspired by [SemIf](https://github.com/TheoLeeCJ/SemIf). The server also supports text generation through OpenAI-compatible Responses and Chat Completions endpoints, using the same loaded model as typed decisions.
 
 The default model is `google/gemma-4-E2B-it`. Use `--model` to select another compatible Hugging Face causal LM or a local checkpoint in Transformers format. GGUF files are not currently supported.
 
@@ -106,7 +106,7 @@ $env:OEV_MAX_CONCURRENCY = "4"
 uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device hybrid-cuda --dtype bfloat16
 ```
 
-`OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads the model once and allows up to four simultaneous inferences by default. Questions within one request run sequentially, and requests wait when the concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length.
+`OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads the model once and allows up to four simultaneous inferences by default, shared across decisions and text generation. A generation holds one slot until it finishes or cancellation is observed. Questions within one decision request run sequentially, and requests wait when the concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length and generation KV caches.
 
 The default device is `auto`. The example explicitly selects `hybrid-cuda` for a 6 GB CUDA GPU. This mode requires Gemma 4 and a CUDA GPU with bfloat16 support.
 
@@ -127,6 +127,75 @@ When using the System One Python SDK, set `base_url="http://127.0.0.1:8000"` and
 All questions in a request share the same `state`, and oev runs the model once per question. `choice` and `score` accept up to 36 options or levels. `noul` evaluates `false` and `true` and returns `p(true)`. `score` returns the probability-weighted average of the level indices. A single option or level produces a deterministic result without running the model.
 
 `confidence` summarizes how concentrated the probability distribution is. For `choice`, it uses `(max probability − 1/K) / (1 − 1/K)`; for `score`, it uses the average distance from the most probable level. These values are not calibrated probabilities of correctness, so thresholds for automated actions should be validated on actual application data. `usage.input_tokens` sums the prompt tokens across questions, and `usage.output_tokens` is zero because no tokens are generated. The default server provides no authentication; use authentication and TLS in front of it when exposing it externally.
+
+## Responses and Chat Completions
+
+The same `oev-serve` process exposes `POST /v1/responses` and `POST /v1/chat/completions`. These implement the text-generation subset of the [OpenAI API formats](https://developers.openai.com/api/docs/guides/migrate-to-responses). There is no second model load. HF and `hybrid-cuda` backends both support generation, and each request owns a separate KV cache. Decision requests still use their optimized next-token readout.
+
+`GET /v1/models` includes the OpenAI-compatible `object` and `data` fields alongside the existing System One `models` array. Both lists describe the same served model name.
+
+With an OpenAI Python SDK installed in your client environment:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
+model = client.models.list().data[0].id
+
+response = client.responses.create(
+    model=model,
+    instructions="Answer briefly in Korean.",
+    input="What is the difference between a choice and a score?",
+    max_output_tokens=128,
+    store=False,
+)
+print(response.output_text)
+
+completion = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Say hello in Korean."}],
+    max_completion_tokens=128,
+)
+print(completion.choices[0].message.content)
+```
+
+Both endpoints accept `stream=True` for SSE output. Chat Completions sends `chat.completion.chunk` objects and ends with `[DONE]`; `stream_options={"include_usage": True}` adds a final usage chunk. Responses sends lifecycle events, `response.output_text.delta`, and a terminal `response.completed` or `response.incomplete` event.
+
+```python
+with client.responses.create(
+    model=model, input="Say hello in Korean.", stream=True, max_output_tokens=128,
+) as stream:
+    for event in stream:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+```
+
+The supported request fields are:
+
+| Endpoint | Fields |
+| --- | --- |
+| Both | `model`, `temperature` (0–2; default 0 for greedy decoding), `top_p` (greater than 0 and at most 1), `stream`, `store` (false only) |
+| Chat Completions | `messages`, `max_completion_tokens` or `max_tokens`, `stop` (up to four strings), `n` (1 only), `stream_options.include_usage`, `response_format` (text only) |
+| Responses | `input` (string or message array), `instructions`, `max_output_tokens`, `text.format` (text only) |
+
+Messages support `system`, `developer`, `user`, and `assistant` roles. Developer messages are passed to model templates as system messages. Content can be a string or text parts (`text` for Chat Completions; `input_text`/`output_text` for Responses). For another turn, resend the history; Responses output message items can be appended to the next `input` array.
+
+Output limits default to 256 and accept 1–4,096 tokens. Prompts obey `--max-input-tokens`, and prompt plus requested output must fit the model context. Input is never truncated. Token usage includes generated stop/EOS tokens, even when they are omitted from displayed text. A length-limited completion reports `finish_reason="length"`; Responses reports `status="incomplete"` with `incomplete_details.reason="max_output_tokens"`.
+
+These endpoints are stateless: response storage, `previous_response_id`, tool calls, multimodal input/output, log probabilities, and JSON/schema output constraints are unsupported. Unsupported fields and invalid generation inputs return HTTP `400` with an OpenAI-style error object; an unknown model returns `404`. System One keeps its existing `422` validation behavior. Generation failures return `500`, or a streaming error event after SSE starts. Client disconnection cancels a stream between model forwards; its execution slot remains occupied until the worker exits.
+
+The Python API can generate using an existing decision backend too:
+
+```python
+from oev import GenerationEngine, GenerationOptions
+
+generation = GenerationEngine(engine.backend, max_input_tokens=engine.max_input_tokens)
+prepared = generation.prepare(
+    [{"role": "user", "content": "Say hello in Korean."}],
+    GenerationOptions(max_new_tokens=128),
+)
+print(generation.generate(prepared).text)
+```
 
 ## Computation and limits
 

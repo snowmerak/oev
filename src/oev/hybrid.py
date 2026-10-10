@@ -76,3 +76,28 @@ class HybridGemma4Backend:
             if cap is not None:
                 selected = torch.tanh(selected / cap) * cap
             return selected.float().tolist()
+
+    def generate_tokens(self, input_ids, options, cancel):
+        from .generation import sample_tokens
+
+        return sample_tokens(self._generation_step, self.model, input_ids, options, cancel)
+
+    def _generation_step(self, input_ids, cache, sequence_length):
+        import torch
+        import torch.nn.functional as F
+
+        tokens = torch.tensor([input_ids], dtype=torch.long)
+        embeddings = self.text_model.embed_tokens(tokens)
+        per_layer_inputs = self.text_model.get_per_layer_inputs(tokens, embeddings)
+        output = self.text_model(
+            inputs_embeds=embeddings.to("cuda"),
+            per_layer_inputs=per_layer_inputs.to("cuda"),
+            attention_mask=torch.ones((1, sequence_length), dtype=torch.long, device="cuda"),
+            past_key_values=cache, use_cache=True, return_dict=True,
+        )
+        hidden = output.last_hidden_state[:, -1, :].cpu()
+        logits = F.linear(hidden, self.model.lm_head.weight, self.model.lm_head.bias)[0]
+        cap = self.model.config.get_text_config().final_logit_softcapping
+        if cap is not None:
+            logits = torch.tanh(logits / cap) * cap
+        return logits, output.past_key_values

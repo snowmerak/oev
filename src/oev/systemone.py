@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import json
-from threading import BoundedSemaphore
-from typing import Any, Mapping
+from threading import BoundedSemaphore, Event
+from typing import Any, Iterator, Mapping
 
 from .engine import DecisionEngine
+from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration
 from .types import Decision, MAX_OPTIONS, Option
 
 
@@ -117,7 +118,7 @@ def _score_confidence(probabilities: list[float]) -> float:
 
 
 class SystemOneService:
-    """Evaluate System One requests with one oev decision per nontrivial question."""
+    """Share one backend and inference limit across decisions and text generation."""
 
     def __init__(
         self,
@@ -136,6 +137,32 @@ class SystemOneService:
         self.release_date = release_date or date.today().isoformat()
         self.max_concurrency = max_concurrency
         self._inference_slots = BoundedSemaphore(max_concurrency)
+
+    def prepare_generation(
+        self, messages: list[dict[str, str]], options: GenerationOptions,
+    ) -> PreparedGeneration:
+        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
+        return engine.prepare(messages, options)
+
+    def generate(self, prepared: PreparedGeneration) -> GenerationResult:
+        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
+        with self._inference_slots:
+            return engine.generate(prepared)
+
+    def stream_generation(
+        self, prepared: PreparedGeneration, cancel: Event,
+    ) -> Iterator[str | GenerationResult]:
+        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
+        # A disconnected request can leave the queue without taking a slot.
+        while not cancel.is_set():
+            if self._inference_slots.acquire(timeout=0.1):
+                break
+        else:
+            return
+        try:
+            yield from engine.stream(prepared, cancel)
+        finally:
+            self._inference_slots.release()
 
     def models(self) -> dict[str, Any]:
         return {
