@@ -9,6 +9,15 @@ class HybridGemma4Backend:
 
         if type(model).__name__ != "Gemma4ForConditionalGeneration":
             raise ValueError("hybrid-cuda requires a Gemma4ForConditionalGeneration checkpoint")
+        if hasattr(model, "ct_decompress_hook"):
+            from compressed_tensors.compressors import ModelCompressor
+
+            # The split decoder bypasses the root hook. Expand weights on CPU
+            # before placing decoder layers on CUDA, without a dummy forward.
+            # These persistent parameters still need version counters when
+            # Module.to() moves them across devices.
+            with torch.no_grad():
+                ModelCompressor.from_pretrained_model(model).decompress_model(model)
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.model_name = model_name

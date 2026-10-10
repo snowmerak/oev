@@ -28,7 +28,7 @@ uv sync --locked --extra hf --extra qat
 uv run --locked --extra hf --extra qat oev --model google/gemma-4-E4B-it-qat-w4a16-ct --revision 6cd26aaa2357fb2bad8c51699a7558a4d1a965bb --device cuda --dtype bfloat16 --input examples/decisions.jsonl --output results/qat-demo.jsonl
 ```
 
-The installed Transformers/compressed-tensors runtime expands packed W4A16 weights for inference on the first forward pass. Checkpoint size therefore does not represent runtime GPU memory use. oev preserves the model's decompression hook for that first pass and can use selective output projection afterward.
+The installed Transformers/compressed-tensors runtime expands packed W4A16 weights for inference on the first forward pass. Checkpoint size therefore does not represent runtime GPU memory use. oev serializes this initial decompression and can use selective output projection afterward. In `hybrid-cuda` mode, supported Gemma 4 QAT models are decompressed on the CPU during loading, before decoder layers are moved to CUDA; sufficient CPU RAM and GPU memory for the expanded weights are still required.
 
 Gemma 4 12B QAT loads on the tested 6 GB Windows GPU, but its default whole-model decompression runs out of memory even with shared GPU memory. The experimental [CT probe](scripts/probe_ct_w4a16.py) keeps symmetric group-32 W4 weights packed and temporarily expands each Linear layer for BF16 computation. It uses ordinary BF16 matrix multiplication and leaves the default loader unchanged. The probe defaults to the tested 12B checkpoint and pinned revision; see the [12B execution report](reports/gemma4-12b-qat-w4a16-cuda-20261008.md).
 
@@ -130,7 +130,7 @@ All questions in a request share the same `state`, and oev runs the model once p
 
 ## Computation and limits
 
-The Gemma 4 backend projects the final hidden state **only onto output weight rows corresponding to the option tokens**. It skips the final projection over the full vocabulary but still performs the model forward pass over the input prompt. For other compatible models, it uses `logits_to_keep=1` when supported to compute only the last position before reading the option logits.
+The Gemma 4 backend, including Gemma4Unified models such as 12B, projects the final hidden state **only onto output weight rows corresponding to the option tokens**. It skips the final projection over the full vocabulary but still performs the model forward pass over the input prompt. For other compatible models, it uses `logits_to_keep=1` when supported to compute only the last position before reading the option logits.
 
 Before inference, oev checks that each label is exactly one token and does not merge with the end of the prompt. It raises an error if either condition fails. Input is never truncated automatically; the default limit is 4,096 tokens. File processing runs one decision at a time and reuses the loaded model. SemIf's prefix cache optimization is not implemented yet.
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
+from threading import Lock
 
 
 class HuggingFaceBackend:
@@ -12,11 +14,17 @@ class HuggingFaceBackend:
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.model_name = model_name
+        self._decompression_lock = Lock()
         self._keep_last_only = "logits_to_keep" in inspect.signature(model.forward).parameters
         # Gemma 4's causal head is a linear projection followed only by optional
         # tanh softcapping. Selecting its weight rows avoids projecting 262k tokens.
         self._selective_gemma4 = (
-            type(model).__name__ in {"Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"}
+            type(model).__name__ in {
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
+                "Gemma4UnifiedForCausalLM",
+                "Gemma4UnifiedForConditionalGeneration",
+            }
             and isinstance(model.lm_head, torch.nn.Linear)
         )
 
@@ -67,7 +75,10 @@ class HuggingFaceBackend:
         }
         if self._keep_last_only:
             kwargs["logits_to_keep"] = 1
-        with torch.inference_mode():
+        # CT's first forward mutates shared weights. Waiting callers must check
+        # the hooks again after acquiring the lock; later forwards can overlap.
+        initialization = self._decompression_lock if hasattr(self.model, "ct_decompress_hook") else nullcontext()
+        with initialization, torch.inference_mode():
             # Compressed-tensors decompresses packed weights in a root pre-hook
             # on the first forward. Calling only the decoder would bypass it.
             if self._selective_gemma4 and not self.model._forward_pre_hooks:

@@ -59,3 +59,54 @@ def test_on_demand_rejects_unsupported_group_before_removing_hook():
     with pytest.raises(ValueError, match="expected symmetric W4A16 group 32"):
         probe.enable_on_demand(model)
     assert hasattr(model, "ct_decompress_hook")
+
+
+def test_unified_on_demand_inference_preserves_packed_weights_with_selective_head(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from oev.hf import HuggingFaceBackend
+
+    config = transformers.Gemma4UnifiedTextConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=16,
+        max_position_embeddings=128, sliding_window=32,
+        layer_types=["sliding_attention", "full_attention"], final_logit_softcapping=2.0,
+    )
+    model = transformers.Gemma4UnifiedForConditionalGeneration(
+        transformers.Gemma4UnifiedConfig(text_config=config)
+    ).eval()
+    quantization = QuantizationConfig(
+        config_groups={"weights": QuantizationScheme(
+            targets=["Linear"], format="pack-quantized",
+            weights=QuantizationArgs(
+                num_bits=4, type="int", symmetric=True, strategy="group", group_size=32,
+            ),
+        )},
+        ignore=["lm_head"], format="pack-quantized", quantization_status="frozen",
+    )
+    apply_quantization_config(model, quantization)
+    for layer in model.modules():
+        if hasattr(layer, "weight_scale"):
+            layer.weight_scale.data.fill_(0.01)
+    ModelCompressor(quantization_config=quantization).compress_model(model)
+    packed = {
+        name: layer.weight_packed.clone()
+        for name, layer in model.named_modules() if hasattr(layer, "weight_packed")
+    }
+    assert probe.enable_on_demand(model) == len(packed)
+    backend = HuggingFaceBackend(model, tokenizer=None, model_name="tiny-unified-packed")
+    ids, slots = [2, 4, 8, 12], [5, 7]
+    with torch.inference_mode():
+        expected = model(
+            input_ids=torch.tensor([ids]), use_cache=False, logits_to_keep=1,
+        ).logits[0, -1, slots].tolist()
+
+    def no_full_projection(*args, **kwargs):
+        raise AssertionError("full-vocabulary projection was called")
+
+    monkeypatch.setattr(model.lm_head, "forward", no_full_projection)
+    for _ in range(2):
+        assert backend.selected_logits(ids, slots) == pytest.approx(expected, abs=1e-6)
+    for name, layer in model.named_modules():
+        if name in packed:
+            assert torch.equal(layer.weight_packed, packed[name])
+            assert not hasattr(layer, "weight")
