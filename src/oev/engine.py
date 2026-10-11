@@ -11,6 +11,25 @@ from .prompt import Tokenizer, prepare
 from .types import Decision, DecisionResult, conditional_softmax
 
 
+def model_backend(source: str, backend: str = "auto") -> str:
+    """Resolve explicit backends and unambiguous GGUF/MLX source formats."""
+    if backend not in {"auto", "hf", "gguf", "mlx"}:
+        raise ValueError("backend must be auto, hf, gguf, or mlx")
+    if backend != "auto":
+        return backend
+    path = Path(source).expanduser()
+    if path.suffix.lower() == ".gguf":
+        return "gguf"
+    if source.startswith("mlx-community/"):
+        return "mlx"
+    config_path = path / "config.json"
+    if config_path.is_file():
+        quantization = json.loads(config_path.read_text(encoding="utf-8")).get("quantization")
+        if isinstance(quantization, dict) and "bits" in quantization and "group_size" in quantization:
+            return "mlx"
+    return "hf"
+
+
 class LogitBackend(Protocol):
     tokenizer: Tokenizer
     model_name: str
@@ -39,10 +58,8 @@ class DecisionEngine:
         chat_template: str | None = None,
     ) -> "DecisionEngine":
         source = str(Path(model).expanduser()) if Path(model).expanduser().exists() or model.startswith("~") else model
-        if backend not in {"auto", "hf", "gguf"}:
-            raise ValueError("backend must be auto, hf, or gguf")
-        use_gguf = backend == "gguf" or (backend == "auto" and Path(source).suffix.lower() == ".gguf")
-        if use_gguf:
+        selected_backend = model_backend(source, backend)
+        if selected_backend == "gguf":
             from .gguf import GGUFBackend
 
             if revision is not None or dtype != "auto":
@@ -54,6 +71,12 @@ class DecisionEngine:
             return cls(loaded, max_input_tokens=max_input_tokens)
         if gpu_layers is not None or chat_template is not None or context_length != 8192:
             raise ValueError("context_length, gpu_layers, and chat_template are GGUF-only options")
+        if selected_backend == "mlx":
+            from .mlx import MLXBackend
+
+            loaded = MLXBackend.load(source, revision=revision, device=device, dtype=dtype,
+                                     local_files_only=local_files_only)
+            return cls(loaded, max_input_tokens=max_input_tokens)
         path = Path(source)
         if path.is_file():
             raise ValueError("the HF backend requires a model directory; use backend=gguf for .gguf files")
@@ -67,7 +90,7 @@ class DecisionEngine:
                 config = json.loads(config_path.read_text(encoding="utf-8"))
                 quantization = config.get("quantization")
                 if isinstance(quantization, dict) and "bits" in quantization and "group_size" in quantization:
-                    raise ValueError("MLX-quantized checkpoints are unsupported; use a Transformers checkpoint or a GGUF file")
+                    raise ValueError("MLX-quantized checkpoints require backend=mlx instead of hf")
         offline = {"local_files_only": True} if local_files_only else {}
         if device == "hybrid-cuda":
             from .hybrid import HybridGemma4Backend

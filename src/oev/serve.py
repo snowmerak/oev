@@ -14,7 +14,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .chat import add_chat_routes
-from .engine import DecisionEngine
+from .engine import DecisionEngine, model_backend
 from .models import ModelRegistry
 from .systemone import SystemOneService
 from .types import MAX_OPTIONS
@@ -133,7 +133,7 @@ class ModelConfig(BaseModel):
     dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
     max_input_tokens: int = Field(default=4096, ge=1, strict=True)
     max_concurrency: int = Field(default=4, ge=1, strict=True)
-    backend: Literal["auto", "hf", "gguf"] = "auto"
+    backend: Literal["auto", "hf", "gguf", "mlx"] = "auto"
     local_files_only: bool = Field(default=False, strict=True)
     context_length: int = Field(default=8192, ge=1, strict=True)
     gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
@@ -181,7 +181,11 @@ def model_configs(args, parser) -> list[ModelConfig]:
     if len(set(names)) != len(names):
         parser.error("served model names must be unique")
     for config in configs:
-        gguf = config.backend == "gguf" or (config.backend == "auto" and Path(config.model).suffix.lower() == ".gguf")
+        try:
+            backend = model_backend(config.model, config.backend)
+        except ValueError as exc:
+            parser.error(f"model {config.name!r}: {exc}")
+        gguf = backend == "gguf"
         if gguf:
             if config.dtype != "auto" or config.revision is not None or config.device == "hybrid-cuda":
                 parser.error(f"model {config.name!r}: GGUF does not accept dtype, revision, or hybrid-cuda")
@@ -193,6 +197,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
                 parser.error(f"model {config.name!r}: a GPU device requires nonzero gpu_layers")
         elif config.gpu_layers is not None or config.chat_template is not None or config.context_length != 8192:
             parser.error(f"model {config.name!r}: context_length, gpu_layers, and chat_template are GGUF-only")
+        if backend == "mlx" and (config.device not in {"auto", "cpu", "mps"} or config.dtype != "auto"):
+            parser.error(f"model {config.name!r}: MLX requires device=auto/cpu/mps and dtype=auto")
         if config.device == "hybrid-cuda" and config.dtype not in {"auto", "bfloat16"}:
             parser.error(f"model {config.name!r}: hybrid-cuda requires bfloat16")
     return configs
@@ -204,8 +210,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--served-model", action="append", help="API model name; repeat once per --model, in the same order")
     parser.add_argument("--models-config", help="JSON array with per-model loading options")
     parser.add_argument("--revision", help="Hugging Face commit revision")
-    parser.add_argument("--backend", choices=["auto", "hf", "gguf"], default="auto", help="Auto detects .gguf file paths; other sources use HF")
-    parser.add_argument("--local-files-only", action="store_true", help="HF: use downloaded files/cache without network access")
+    parser.add_argument("--backend", choices=["auto", "hf", "gguf", "mlx"], default="auto", help="Auto detects GGUF paths and MLX quantized folders/mlx-community IDs; otherwise HF")
+    parser.add_argument("--local-files-only", action="store_true", help="HF/MLX: use downloaded files/cache without network access")
     parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size, including generated tokens")
     parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all; auto/cpu defaults to 0")
     parser.add_argument("--chat-template", help="GGUF: override embedded chat template with a Jinja file")

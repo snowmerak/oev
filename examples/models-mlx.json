@@ -1,0 +1,22 @@
+[
+  {
+    "model": "./models/mlx-small",
+    "served_model": "mlx-small",
+    "backend": "mlx",
+    "device": "auto",
+    "dtype": "auto",
+    "local_files_only": true,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/mlx-large",
+    "served_model": "mlx-large",
+    "backend": "mlx",
+    "device": "auto",
+    "dtype": "auto",
+    "local_files_only": true,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  }
+]

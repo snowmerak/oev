@@ -2,7 +2,7 @@
 
 `oev` is a small Python library for choosing one option with a language model. Its decision path builds a prompt from `state`, `question`, and `options`, runs the model once, and reads the next-token logits for option labels `a`–`z` and `0`–`9`. The direct logit readout approach is inspired by [SemIf](https://github.com/TheoLeeCJ/SemIf). The server also supports text generation through OpenAI-compatible Responses and Chat Completions endpoints, using the same loaded model as typed decisions.
 
-The default model is `google/gemma-4-E2B-it`. Use `--model` to select another compatible Hugging Face causal LM or a local checkpoint in Transformers format. GGUF files are not currently supported.
+The default model is `google/gemma-4-E2B-it`. Use `--model` to select a compatible Hugging Face causal LM, a local Transformers checkpoint, a GGUF file, or an MLX checkpoint on Apple Silicon.
 
 ## Quick start
 
@@ -182,9 +182,9 @@ The downloader does not determine the backend: the downloaded **file format** do
 
 | Downloaded format | Model source | Backend |
 | --- | --- | --- |
-| Transformers checkpoint | Directory with config, tokenizer/chat template, and all weight files; or a cached HF repository ID | `hf` (default for non-GGUF sources) |
+| Transformers checkpoint | Directory with config, tokenizer/chat template, and all weight files; or a cached HF repository ID | `hf` |
 | GGUF text model | Path to a specific `.gguf` file, including an LM Studio download | `gguf` (auto-detected by file extension) |
-| MLX quantized checkpoint | MLX directory | Unsupported; obtain a Transformers checkpoint or GGUF instead |
+| MLX checkpoint | Complete MLX directory or HF repository ID | `mlx` (Apple Silicon macOS) |
 
 ### `hf download`
 
@@ -208,7 +208,7 @@ uv run --locked --extra gguf --extra serve oev-serve --model "C:/path/to/model.Q
 
 GGUF support uses the optional [llama-cpp-python runtime](https://llama-cpp-python.readthedocs.io/en/latest/), which must support the model's architecture. Installing this extra may require a native compiler; GPU offload requires a build for your GPU backend. It loads quantized weights directly without converting them to Transformers weights. Selection, Responses, Chat Completions, and SSE all reuse that loaded instance.
 
-GGUF `device=auto` defaults to CPU. Set `gpu_layers`/`--gpu-layers` to the number of layers to offload, or `-1` for all, with a GPU-capable runtime. `device=cuda` or `mps` requests all layers by default; the installed native runtime determines the GPU backend. `device=cpu` requires zero offloaded layers. `context_length` defaults to 8,192 and includes prompt plus requested output. The GGUF's quantization determines its weight type, so `dtype` must remain `auto`; `revision` and `hybrid-cuda` are HF-only. `context_length`, `gpu_layers`, and `chat_template` are GGUF-only options.
+GGUF `device=auto` defaults to CPU. Set `gpu_layers`/`--gpu-layers` to the number of layers to offload, or `-1` for all, with a GPU-capable runtime. `device=cuda` or `mps` requests all layers by default; the installed native runtime determines the GPU backend. `device=cpu` requires zero offloaded layers. `context_length` defaults to 8,192 and includes prompt plus requested output. The GGUF's quantization determines its weight type, so `dtype` must remain `auto`. `revision` is supported by HF and MLX; `hybrid-cuda` is HF-only. `context_length`, `gpu_layers`, and `chat_template` are GGUF-only options.
 
 The model's embedded Jinja chat template is used with `enable_thinking=False`. If absent, provide `--chat-template path/to/chat.jinja` (or `chat_template` in JSON) with the correct template. The same exact single-token answer-label and prompt-boundary validation applies to GGUF decisions; incompatible tokenizers fail clearly. All native end-of-generation tokens, including end-of-turn markers, stop generation and count toward usage without appearing in output text.
 
@@ -220,7 +220,7 @@ To mix offline HF and GGUF models, edit the paths in [examples/models-local.json
 uv run --locked --extra hf --extra gguf --extra serve oev-serve --models-config examples/models-local.json
 ```
 
-Relative paths are resolved from the server's working directory. No automatic LM Studio model scanning, model downloading, or MLX runtime is added. LM Studio need not run for direct local GGUF loading.
+Relative paths are resolved from the server's working directory. Local sources are loaded directly without LM Studio running. Model directories are not scanned automatically; pass the actual downloaded path.
 
 The Python loader accepts the same settings:
 
@@ -238,9 +238,40 @@ uv run --locked --extra gguf --extra serve --extra test python -m pytest -q test
 
 Without that environment variable, the real GGUF test is skipped; simulated tests do not establish compatibility with every GGUF architecture.
 
+### MLX on Mac Studio
+
+The optional [mlx-lm runtime](https://github.com/ml-explore/mlx-lm) loads MLX weights directly on Apple Silicon macOS. A complete model directory downloaded with `hf download` or LM Studio can be used as-is, including quantized weights:
+
+```bash
+git pull
+uv sync --locked --extra mlx --extra serve
+uv run --locked --extra mlx --extra serve oev-serve --backend mlx --model "/path/to/mlx-model" --served-model mlx-local --device auto --local-files-only --max-concurrency 1
+```
+
+For an HF repository, use `--backend mlx --model owner/model`; add `--local-files-only` to use a previously downloaded HF cache, and `--revision` to choose a revision. Online repository loading downloads the snapshot. Automatic backend selection recognizes `mlx-community/` repository IDs and local configs with MLX `quantization.bits` and `quantization.group_size`; use an explicit backend for other sources, including unquantized local MLX checkpoints. A single weight file is insufficient: the directory must include model config, tokenizer/chat template, and every weight shard.
+
+`device=auto` and `mps` use Metal; `cpu` selects MLX CPU execution. Keep `dtype=auto` to use the checkpoint's stored dtype and quantization. Selection, Responses, Chat Completions, and SSE share the same resident model. Each request gets a fresh KV cache, and inference is serialized per model even with a larger `max_concurrency`. Cancellation is checked between prompt chunks and generation forwards; pending work is synchronized before releasing the model lock. Separate registered models retain independent weights and execution streams.
+
+The checkpoint's tokenizer chat template and EOS/end-of-turn token IDs are used. Prompts obey `max_input_tokens`; prompt plus requested output also obeys `max_position_embeddings` when declared in the config. MLX computes final-token vocabulary logits and selects the answer rows; HF's Gemma-specific projection optimization does not apply. Available architectures depend on the installed `mlx-lm` version.
+
+To keep multiple MLX models loaded, edit the paths in [examples/models-mlx.json](examples/models-mlx.json), then run:
+
+```bash
+uv run --locked --extra mlx --extra serve oev-serve --models-config examples/models-mlx.json
+```
+
+Windows tests use a simulated MLX runtime to cover loading, cache isolation, sampling, API responses, SSE, serialization, cancellation, and failures. The following opt-in test runs real Metal inference on your Mac, comparing greedy output with `mlx-lm.generate_step`, checking selection logits against a full forward, and checking repeated requests for cache contamination:
+
+```bash
+export OEV_TEST_MLX_PATH="/path/to/mlx-model"
+uv run --locked --extra mlx --extra serve --extra test python -m pytest -q tests/test_mlx.py
+```
+
+The real MLX test is skipped without that variable or outside macOS. Real MLX/Metal execution has not been verified on Windows.
+
 ## Responses and Chat Completions
 
-The same `oev-serve` process exposes `POST /v1/responses` and `POST /v1/chat/completions`. These implement the text-generation subset of the [OpenAI API formats](https://developers.openai.com/api/docs/guides/migrate-to-responses). Generation uses the selected model's existing decision backend without another model load. HF and `hybrid-cuda` backends both support generation, and each request owns a separate KV cache. Decision requests still use their optimized next-token readout.
+The same `oev-serve` process exposes `POST /v1/responses` and `POST /v1/chat/completions`. These implement the text-generation subset of the [OpenAI API formats](https://developers.openai.com/api/docs/guides/migrate-to-responses). Generation uses the selected model's existing decision backend without another model load. HF, `hybrid-cuda`, GGUF, and MLX backends support generation; each request owns an isolated KV context. Decision requests use the backend's next-token readout.
 
 `GET /v1/models` includes the OpenAI-compatible `object` and `data` fields alongside the existing System One `models` array. Both lists describe the same set of served model names.
 
@@ -309,7 +340,7 @@ print(generation.generate(prepared).text)
 
 ## Computation and limits
 
-The Gemma 4 backend, including Gemma4Unified models such as 12B, projects the final hidden state **only onto output weight rows corresponding to the option tokens**. It skips the final projection over the full vocabulary but still performs the model forward pass over the input prompt. For other compatible models, it uses `logits_to_keep=1` when supported to compute only the last position before reading the option logits.
+The HF Gemma 4 backend, including Gemma4Unified models such as 12B, projects the final hidden state **only onto output weight rows corresponding to the option tokens**. It skips the final projection over the full vocabulary but still performs the model forward pass over the input prompt. For other compatible HF models, it uses `logits_to_keep=1` when supported to compute only the last position before reading the option logits.
 
 Before inference, oev checks that each label is exactly one token and does not merge with the end of the prompt. It raises an error if either condition fails. Input is never truncated automatically; the default limit is 4,096 tokens. File processing runs one decision at a time and reuses the loaded model. SemIf's prefix cache optimization is not implemented yet.
 

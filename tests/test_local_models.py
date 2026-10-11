@@ -334,7 +334,7 @@ def test_directory_containing_gguf_requires_an_explicit_file(native):
 def test_mlx_quantized_directory_has_an_explicit_format_error(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"quantization": {"bits": 4, "group_size": 64}}), encoding="utf-8")
     with pytest.raises(ValueError, match="MLX-quantized"):
-        DecisionEngine.from_pretrained(str(tmp_path))
+        DecisionEngine.from_pretrained(str(tmp_path), backend="hf")
 
 
 @pytest.mark.parametrize("entry", [
