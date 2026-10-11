@@ -152,6 +152,9 @@ For different devices, revisions, or limits, use `--models-config` with a nonemp
 | `gguf-local-cpu` | Local GGUF on CPU |
 | `gguf-local-metal-flash-attn` | Local GGUF on Metal with Flash Attention requested |
 | `mlx-local-small-metal`, `mlx-local-large-metal` | Two offline MLX directories on Metal |
+| `embedding-qwen3-hf-cpu`, `embedding-gemma2-hf-cpu` | HF text embedding checkpoints on CPU |
+| `embedding-qwen3-gguf-metal`, `embedding-gemma2-gguf-metal` | GGUF text embeddings on Metal, with explicit pooling and search prefixes |
+| `embedding-qwen3-mlx-metal` | Offline MLX Qwen3 embedding checkpoint on Metal |
 
 Copy the entries you want into `config.json` as a JSON array, and replace the example model paths. Keep only the entries supported by your machine and needed for this server: every entry is loaded, including separate instances when two entries point to the same checkpoint. JSON has no comments; the served names explain each example and are also the model names clients send in API requests.
 
@@ -188,6 +191,47 @@ app = create_app(registry)
 ```
 
 `create_app(single_service)` remains supported. The registry retains the supplied services and routes to them without loading additional model copies.
+
+## Text embeddings
+
+Register an embedding checkpoint with `"task": "embedding"` in the same `--models-config` array as your generation models. Existing entries default to `task=generation` and continue to support both generation and System One. Every model stays loaded and appears in `/v1/models`; requests select its `served_model` name. Embedding models accept `/v1/embeddings` only, and generation models reject embedding requests before inference. Include every model-specific processor file in downloaded HF directories, including EmbeddingGemma2's `chat_template.jinja`; embedding input formatting is handled by the model's processor.
+
+For HF models install the `embeddings` extra (Sentence Transformers 6.1 and Transformers 5.18+). Native checkpoint pooling, normalization modules, and projection heads are retained. [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) uses last-token pooling; [EmbeddingGemma2](https://huggingface.co/google/embeddinggemma-2) has a learned projection head and requires float32 or bfloat16. HF EmbeddingGemma2 loads text only, omitting vision/audio encoders; `dtype=auto` uses float32 for that architecture. Complete local directories and offline HF cache loading work as for generation models.
+
+Copy the embedding examples you need from [examples/models.json](examples/models.json) into your existing `config.json`. To mix HF embedding models with MLX and GGUF generation models on Mac:
+
+```bash
+uv run --locked --extra embeddings --extra mlx --extra gguf --extra serve \
+  oev-serve --models-config config.json
+```
+
+For a single HF embedding model you can use `--task embedding --model Qwen/Qwen3-Embedding-0.6B --served-model embed --device cpu`. For GGUF use the existing `gguf` extra with a local embedding `.gguf` path downloaded by `hf download` or `lms get`; no separate embedding dependency is needed. The native runtime must support that architecture. Set `pooling=last` for Qwen3 and `pooling=mean` for EmbeddingGemma2, as in the examples; `auto` respects native model metadata. Per-token/reranking outputs are rejected. `n_batch` and `n_ubatch` both use `context_length` so a pooled input fits a physical batch without silent truncation. GPU offload and Flash Attention settings work as for GGUF generation.
+
+MLX text embeddings use the separate `mlx-embeddings` extra on Apple Silicon. They use a shared stream under a per-model lock, including loading and HTTP worker inference. The pinned runtime supports Qwen3, BERT, XLM-RoBERTa, and ModernBERT text embeddings. **EmbeddingGemma2 is not supported by the pinned MLX embedding runtime; use HF or GGUF for it.** Unsupported architectures fail at startup rather than returning a substitute vector. Add `--extra mlx-embeddings` when using the MLX embedding example.
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"embedding-qwen3-hf-cpu","input":["강아지는 무엇을 먹나요?"],"input_type":"query","dimensions":128}'
+```
+
+**EmbeddingGemma2 GGUF runtime:** the stock `llama-cpp-python 0.3.36` runtime predates `gemma-embedding2` and cannot load that architecture. Set `gguf_server_path` to a recent official `llama-server` executable, as in the Gemma2 GGUF example. oev starts one native worker for that model before exposing HTTP, bound to an ephemeral loopback port, and retains it until shutdown. It uses the native projected output dimension, not the model's hidden dimension. Startup errors prevent serving a partial catalog; normal shutdown terminates the worker. Native workers require the full binary distribution, including backend libraries, not just a copied executable. Generation models and other GGUF embedding entries continue to use the Python runtime unless this option is set. Do not replace its DLLs with a newer ABI-incompatible library.
+
+The Windows real-model checks used the official [llama.cpp b11552 release](https://github.com/ggml-org/llama.cpp/releases/tag/b11552) for Gemma2 GGUF. On Mac, download `llama-b11552-bin-macos-arm64.tar.gz` from that release, extract the distribution together, and set `gguf_server_path` to the extracted `llama-server` file. `device=mps` requests Metal offload through the native executable. The native-server mode only requires the `serve` extra; the `gguf` extra is still needed for entries using the Python runtime.
+
+Here, Qwen3-Embedding-0.6B and EmbeddingGemma2 were both downloaded as HF checkpoints and official Q8_0 GGUFs and loaded concurrently into a single registry. Actual HF CUDA and GGUF CPU inference passed batch/single ordering, repeated requests, 128-dimensional truncation followed by normalization, float32 base64, Korean query/document retrieval, token limit rejection, and wrong-task rejection. HF versus Q8_0 GGUF cosine similarity on the test inputs was 0.99886–0.99931 for Qwen3 and 0.99991–0.99992 for Gemma2. This is inference and API evidence, not a throughput benchmark or Mac Metal verification.
+
+The standard request fields are `model`, `input` (a string or up to 128 strings), optional `dimensions`, `encoding_format` (`float` or `base64`), and `user`. Token-ID inputs and multimodal inputs are unsupported. Responses contain an ordered `data` array of embedding objects and actual `prompt_tokens`/`total_tokens` usage. Base64 is little-endian float32, suitable for OpenAI SDK decoding. Output vectors are L2-normalized **after** optional dimension truncation. Use reduced dimensions with models trained for Matryoshka embeddings, such as Qwen3 and EmbeddingGemma2; queries and documents must use the same dimensions.
+
+The optional extension `input_type=query` or `document` prepends the checkpoint's matching Sentence Transformers prefix. For GGUF, configure `embedding_query_prefix` and `embedding_document_prefix`; both are supplied in the examples. These settings can also override HF/MLX checkpoint prefixes. Without `input_type`, input is embedded exactly as supplied and no default prompt is applied, so callers can manually format titled documents or task instructions. All prefixes and special tokens count toward `max_input_tokens`; over-limit inputs return 400 without truncation. Each embedding service serializes inference even if `max_concurrency` is larger; different models retain independent locks. These limits and prefixes are immutable while the server runs.
+
+Run API, runtime policy, and an actual tiny offline HF checkpoint test with:
+
+```bash
+uv run --locked --extra embeddings --extra serve --extra test python -m pytest -q tests/test_embeddings.py
+```
+
+To check a downloaded real model, set `OEV_TEST_EMBEDDING_HF_PATH`, `OEV_TEST_EMBEDDING_GGUF_PATH`, or `OEV_TEST_EMBEDDING_MLX_PATH`, and run `tests/test_embeddings.py::test_real_embedding_checkpoint_when_explicitly_configured`. Set `OEV_TEST_EMBEDDING_POOLING=last` for Qwen3 GGUF, `mean` for Gemma2 GGUF, and optionally `OEV_TEST_EMBEDDING_DEVICE=cpu/cuda/mps/auto`. For Gemma2 GGUF also set `OEV_TEST_GGUF_SERVER_PATH` to the recent native executable. Include the corresponding runtime extra. The test exercises HTTP worker inference, repeated inputs, output dimensions, normalization, and truncation. MLX execution requires Mac hardware; simulated tests on Windows establish caller policy only.
 
 ## Downloaded models and offline loading
 

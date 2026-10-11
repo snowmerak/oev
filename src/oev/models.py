@@ -6,17 +6,22 @@ from collections.abc import Iterable
 from typing import Any
 
 from .systemone import SystemOneService
+from .embeddings import EmbeddingService
 
 
 class ModelNotFound(ValueError):
     """The requested served model name is not registered."""
 
 
+class ModelCapabilityError(ValueError):
+    """The selected model cannot perform the requested operation."""
+
+
 class ModelRegistry:
     """Keep one service per served name, with independent inference limits."""
 
-    def __init__(self, services: Iterable[SystemOneService]) -> None:
-        self._services: dict[str, SystemOneService] = {}
+    def __init__(self, services: Iterable[SystemOneService | EmbeddingService]) -> None:
+        self._services: dict[str, SystemOneService | EmbeddingService] = {}
         for service in services:
             if service.model in self._services:
                 raise ValueError(f"duplicate served model name: {service.model!r}")
@@ -24,11 +29,14 @@ class ModelRegistry:
         if not self._services:
             raise ValueError("at least one model service is required")
 
-    def resolve(self, model: str) -> SystemOneService:
+    def resolve(self, model: str, *, operation: str | None = None) -> SystemOneService | EmbeddingService:
         try:
-            return self._services[model]
+            service = self._services[model]
         except KeyError as exc:
             raise ModelNotFound(f"unknown model: {model!r}") from exc
+        if operation is not None and operation not in service.capabilities:
+            raise ModelCapabilityError(f"model {model!r} does not support {operation}")
+        return service
 
     def models(self) -> dict[str, Any]:
         return {
@@ -43,3 +51,8 @@ class ModelRegistry:
                 for name in self._services
             ],
         }
+
+    def close(self):
+        for service in self._services.values():
+            if isinstance(service, EmbeddingService):
+                service.close()

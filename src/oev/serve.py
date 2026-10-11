@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 from importlib.resources import files
 import json
 import os
@@ -14,6 +15,8 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .chat import add_chat_routes
+from .embedding_api import add_embedding_routes
+from .embeddings import EmbeddingService
 from .engine import DecisionEngine, model_backend
 from .models import ModelRegistry
 from .systemone import SystemOneService
@@ -98,10 +101,19 @@ class ModelMetadataList(BaseModel):
     data: list[dict[str, Any]]
 
 
-def create_app(service: SystemOneService | ModelRegistry) -> FastAPI:
+def create_app(service: SystemOneService | EmbeddingService | ModelRegistry) -> FastAPI:
     registry = service if isinstance(service, ModelRegistry) else ModelRegistry([service])
-    app = FastAPI(title="oev decisions and chat", version="0.1.0")
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            registry.close()
+
+    app = FastAPI(title="oev decisions, chat, and embeddings", version="0.1.0", lifespan=lifespan)
     add_chat_routes(app, registry)
+    add_embedding_routes(app, registry)
 
     @app.get("/.skill", response_class=PlainTextResponse, include_in_schema=False)
     def skill() -> PlainTextResponse:
@@ -114,7 +126,7 @@ def create_app(service: SystemOneService | ModelRegistry) -> FastAPI:
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     def systemone(request: SystemOneRequest) -> dict[str, Any]:
         try:
-            return registry.resolve(request.model).evaluate(request.model_dump())
+            return registry.resolve(request.model, operation="decision").evaluate(request.model_dump())
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -128,6 +140,7 @@ class ModelConfig(BaseModel):
 
     model: str = Field(min_length=1)
     served_model: str | None = Field(default=None, min_length=1)
+    task: Literal["generation", "embedding"] = "generation"
     revision: str | None = Field(default=None, min_length=1)
     device: Literal["auto", "cpu", "cuda", "mps", "hybrid-cuda"] = "auto"
     dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
@@ -139,6 +152,10 @@ class ModelConfig(BaseModel):
     gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
     chat_template: str | None = None
     flash_attn: bool = Field(default=False, strict=True)
+    pooling: Literal["auto", "mean", "last", "cls"] = "auto"
+    embedding_query_prefix: str | None = None
+    embedding_document_prefix: str | None = None
+    gguf_server_path: str | None = None
 
     @field_validator("model", "served_model", "revision")
     @classmethod
@@ -154,6 +171,7 @@ class ModelConfig(BaseModel):
 
 def model_configs(args, parser) -> list[ModelConfig]:
     defaults = {
+        "task": args.task,
         "revision": args.revision, "device": args.device, "dtype": args.dtype,
         "max_input_tokens": args.max_input_tokens, "max_concurrency": args.max_concurrency,
         "backend": args.backend, "local_files_only": args.local_files_only,
@@ -188,6 +206,17 @@ def model_configs(args, parser) -> list[ModelConfig]:
         except ValueError as exc:
             parser.error(f"model {config.name!r}: {exc}")
         gguf = backend == "gguf"
+        if config.gguf_server_path is not None and (not gguf or config.task != "embedding"):
+            parser.error(f"model {config.name!r}: gguf_server_path requires a GGUF embedding model")
+        if config.task == "embedding" and config.chat_template is not None:
+            parser.error(f"model {config.name!r}: embedding models do not use chat_template")
+        if config.task == "generation" and (config.pooling != "auto" or config.embedding_query_prefix is not None
+                                            or config.embedding_document_prefix is not None):
+            parser.error(f"model {config.name!r}: pooling and embedding prefixes require task=embedding")
+        if config.task == "embedding" and config.device == "hybrid-cuda":
+            parser.error(f"model {config.name!r}: embeddings do not support hybrid-cuda")
+        if config.pooling != "auto" and not gguf:
+            parser.error(f"model {config.name!r}: pooling is a GGUF-only option")
         if config.flash_attn and not gguf:
             parser.error(f"model {config.name!r}: flash_attn is a GGUF-only option")
         if gguf:
@@ -208,11 +237,33 @@ def model_configs(args, parser) -> list[ModelConfig]:
     return configs
 
 
+def _load_service(config: ModelConfig):
+    if config.task == "embedding":
+        return EmbeddingService.from_pretrained(
+            config.model, config.name, backend=config.backend, revision=config.revision,
+            device=config.device, dtype=config.dtype, local_files_only=config.local_files_only,
+            max_input_tokens=config.max_input_tokens, max_concurrency=config.max_concurrency,
+            context_length=config.context_length, gpu_layers=config.gpu_layers, flash_attn=config.flash_attn,
+            pooling=config.pooling, query_prefix=config.embedding_query_prefix,
+            document_prefix=config.embedding_document_prefix, gguf_server_path=config.gguf_server_path,
+        )
+    engine = DecisionEngine.from_pretrained(
+        config.model, revision=config.revision, device=config.device, dtype=config.dtype,
+        max_input_tokens=config.max_input_tokens,
+        backend=config.backend, local_files_only=config.local_files_only,
+        context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
+        flash_attn=config.flash_attn,
+    )
+    return SystemOneService(engine, config.name, max_concurrency=config.max_concurrency)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="append", help="Hugging Face model ID or local path; repeat to load multiple models")
     parser.add_argument("--served-model", action="append", help="API model name; repeat once per --model, in the same order")
     parser.add_argument("--models-config", help="JSON array with per-model loading options")
+    parser.add_argument("--task", choices=["generation", "embedding"], default="generation",
+                        help="Default model task; JSON entries can override it")
     parser.add_argument("--revision", help="Hugging Face commit revision")
     parser.add_argument("--backend", choices=["auto", "hf", "gguf", "mlx"], default="auto", help="Auto detects GGUF paths and MLX quantized folders/mlx-community IDs; otherwise HF")
     parser.add_argument("--local-files-only", action="store_true", help="HF/MLX: use downloaded files/cache without network access")
@@ -241,21 +292,20 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("max-input-tokens must be positive")
     configs = model_configs(args, parser)
     services = []
-    # Load every configured model before binding HTTP; no partial model catalog is served.
-    for config in configs:
-        engine = DecisionEngine.from_pretrained(
-            config.model, revision=config.revision, device=config.device, dtype=config.dtype,
-            max_input_tokens=config.max_input_tokens,
-            backend=config.backend, local_files_only=config.local_files_only,
-            context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
-            flash_attn=config.flash_attn,
-        )
-        services.append(SystemOneService(engine, config.name, max_concurrency=config.max_concurrency))
-    service = services[0] if len(services) == 1 else ModelRegistry(services)
+    try:
+        # Load everything before binding HTTP; never expose a partial catalog.
+        for config in configs:
+            services.append(_load_service(config))
+        service = services[0] if len(services) == 1 else ModelRegistry(services)
 
-    import uvicorn
+        import uvicorn
 
-    uvicorn.run(create_app(service), host=args.host, port=args.port)
+        uvicorn.run(create_app(service), host=args.host, port=args.port)
+    finally:
+        # A later load failure or interrupted startup must also stop native workers.
+        for service in services:
+            if isinstance(service, EmbeddingService):
+                service.close()
 
 
 if __name__ == "__main__":

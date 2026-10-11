@@ -64,5 +64,64 @@
     "local_files_only": true,
     "max_input_tokens": 4096,
     "max_concurrency": 1
+  },
+  {
+    "model": "Qwen/Qwen3-Embedding-0.6B",
+    "served_model": "embedding-qwen3-hf-cpu",
+    "task": "embedding",
+    "backend": "hf",
+    "device": "cpu",
+    "dtype": "float32",
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  },
+  {
+    "model": "google/embeddinggemma-2",
+    "served_model": "embedding-gemma2-hf-cpu",
+    "task": "embedding",
+    "backend": "hf",
+    "device": "cpu",
+    "dtype": "float32",
+    "max_input_tokens": 8192,
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "served_model": "embedding-qwen3-gguf-metal",
+    "task": "embedding",
+    "backend": "gguf",
+    "device": "mps",
+    "pooling": "last",
+    "context_length": 8192,
+    "max_input_tokens": 4096,
+    "embedding_query_prefix": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+    "embedding_document_prefix": "",
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/embeddinggemma-2-Q8_0.gguf",
+    "served_model": "embedding-gemma2-gguf-metal",
+    "task": "embedding",
+    "backend": "gguf",
+    "device": "mps",
+    "pooling": "mean",
+    "gguf_server_path": "/path/to/llama-server",
+    "context_length": 8192,
+    "max_input_tokens": 8192,
+    "embedding_query_prefix": "task: search result | query: ",
+    "embedding_document_prefix": "title: none | text: ",
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/mlx-qwen3-embedding",
+    "served_model": "embedding-qwen3-mlx-metal",
+    "task": "embedding",
+    "backend": "mlx",
+    "device": "mps",
+    "local_files_only": true,
+    "embedding_query_prefix": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+    "embedding_document_prefix": "",
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
   }
 ]

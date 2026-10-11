@@ -19,11 +19,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .generation import GenerationOptions, GenerationResult
-from .models import ModelNotFound, ModelRegistry
+from .models import ModelCapabilityError, ModelNotFound, ModelRegistry
 
 
 logger = logging.getLogger(__name__)
-GENERATION_PATHS = {"/v1/chat/completions", "/v1/responses"}
+OPENAI_PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/embeddings"}
 
 
 class APIModel(BaseModel):
@@ -312,9 +312,11 @@ async def responses_stream(service, prepared, body, request, response_id, create
 def add_chat_routes(app: FastAPI, registry: ModelRegistry):
     def resolve(model):
         try:
-            return registry.resolve(model)
+            return registry.resolve(model, operation="generation")
         except ModelNotFound as exc:
             raise APIError(str(exc), status=404, code="model_not_found", param="model") from exc
+        except ModelCapabilityError as exc:
+            raise APIError(str(exc), code="unsupported_operation", param="model") from exc
 
     @app.exception_handler(APIError)
     async def api_error(request, exc):
@@ -322,7 +324,7 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
-        if request.url.path not in GENERATION_PATHS:
+        if request.url.path not in OPENAI_PATHS:
             return await request_validation_exception_handler(request, exc)
         error = exc.errors()[0]
         param = ".".join(str(part) for part in error["loc"] if part != "body")

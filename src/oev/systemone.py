@@ -120,6 +120,8 @@ def _score_confidence(probabilities: list[float]) -> float:
 class SystemOneService:
     """Share one backend and inference limit across decisions and text generation."""
 
+    capabilities = frozenset({"decision", "generation"})
+
     def __init__(
         self,
         engine: DecisionEngine,
