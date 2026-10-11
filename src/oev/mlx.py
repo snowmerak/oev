@@ -45,7 +45,10 @@ class MLXBackend:
             raise RuntimeError("Install MLX support on your Mac with: uv sync --extra mlx --extra serve") from exc
         if device != "cpu" and not mx.metal.is_available():
             raise ValueError("MLX Metal is unavailable; use device=cpu or enable Metal on Apple Silicon")
-        stream = mx.new_thread_local_stream(mx.cpu if device == "cpu" else mx.gpu)
+        # Lazy model constants can retain the loading stream. HTTP inference runs
+        # on other threads, so share one stream under the model lock and sync
+        # before releasing it; thread-local streams cannot evaluate those graphs.
+        stream = mx.new_thread_unsafe_stream(mx.cpu if device == "cpu" else mx.gpu)
         path = Path(source).expanduser()
         if path.is_file():
             raise ValueError("MLX requires a model directory or HF repository ID, not a single weight file")

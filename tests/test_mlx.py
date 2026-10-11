@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import json
 import os
 import sys
-from threading import Event, local
+from threading import Event, get_ident, local
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -35,11 +35,15 @@ class Tokenizer:
 
 
 class Model:
-    def __init__(self, sequence):
+    def __init__(self, sequence, mx):
         self.sequence = sequence
         self.calls = []
+        self.mx = mx
+        # Model initialization may leave lazy constants on the loading stream.
+        self.initialization_stream = mx.current.stream
 
     def __call__(self, ids, cache):
+        self.mx.check_stream(self.initialization_stream)
         state = cache[0]
         if ids.shape[1] == 1:
             state.step += 1
@@ -64,10 +68,27 @@ class MX:
         self.evaluations = []
 
     def new_thread_local_stream(self, device):
-        return SimpleNamespace(device=device)
+        return SimpleNamespace(device=device, per_thread={})
+
+    def new_thread_unsafe_stream(self, device):
+        return SimpleNamespace(device=device, owner=get_ident(), shared=True)
+
+    def resolve_stream(self, stream):
+        if hasattr(stream, "per_thread"):
+            if get_ident() not in stream.per_thread:
+                stream.per_thread[get_ident()] = SimpleNamespace(device=stream.device, owner=get_ident(), shared=False)
+            return stream.per_thread[get_ident()]
+        return stream
+
+    def check_stream(self, stream):
+        stream = self.resolve_stream(stream)
+        if not stream.shared and stream.owner != get_ident():
+            raise RuntimeError("There is no Stream(gpu, 1) in current thread.")
 
     @contextmanager
     def stream(self, stream):
+        stream = self.resolve_stream(stream)
+        self.check_stream(stream)
         previous = getattr(self.current, "stream", None)
         self.current.stream = stream
         try:
@@ -80,6 +101,7 @@ class MX:
         self.evaluations.append(values)
 
     def synchronize(self, stream):
+        self.check_stream(stream)
         self.synchronizations.append(stream)
 
     @staticmethod
@@ -100,7 +122,7 @@ def runtime(monkeypatch, tmp_path):
             "tokenizer_config": {"local_files_only": True, "trust_remote_code": False},
         }
         assert mx.current.stream is not None
-        model = Model([ord("O"), ord("K"), ord(" "), 255])
+        model = Model([ord("O"), ord("K"), ord(" "), 255], mx)
         loaded.append((source, model))
         return model, tokenizer, {"text_config": {"max_position_embeddings": 8192}}
 
@@ -136,6 +158,7 @@ def test_auto_detection_loads_mlx_weights_once_with_metal_and_eager_evaluation(r
     assert isinstance(backend, MLXBackend)
     assert backend.mlx_model is runtime.loaded[0][1]
     assert backend._stream.device == "gpu"
+    assert backend._stream.shared
     assert backend.context_window == 8192
     assert runtime.mx.synchronizations == [backend._stream]
     assert runtime.mx.current.stream is None
@@ -178,6 +201,36 @@ def test_generation_sse_and_selection_share_mlx_model_with_isolated_caches(runti
     assert len(runtime.loaded) == 1
     assert len(runtime.caches) == 4
     assert len({id(cache) for cache in runtime.caches}) == 4
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_loaded_model_can_select_and_generate_from_different_threads(runtime, device):
+    backend = MLXBackend.load(str(runtime.path), device=device)
+    caller = get_ident()
+
+    def work():
+        scores = backend.selected_logits([1, 2, 3], [ord("b")])
+        tokens = list(backend.generate_tokens([1, 2, 3], GenerationOptions(4), Event()))
+        return get_ident(), scores, tokens
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        thread, scores, tokens = pool.submit(work).result(timeout=5)
+    assert thread != caller
+    assert scores == [3]
+    assert tokens == [ord("O"), ord("K"), ord(" "), 255]
+    assert all(stream is backend._stream for stream in runtime.mx.synchronizations)
+
+
+def test_thread_local_loading_stream_reproduces_lazy_constant_failure(runtime, monkeypatch):
+    # Reproduce the old loader while the context itself resolves per thread.
+    monkeypatch.setattr(runtime.mx, "new_thread_unsafe_stream", runtime.mx.new_thread_local_stream)
+    backend = MLXBackend.load(str(runtime.path))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(backend.selected_logits, [1, 2, 3], [ord("b")])
+        with pytest.raises(RuntimeError, match="no Stream.*current thread"):
+            future.result(timeout=5)
+    assert backend._lock.acquire(blocking=False)
+    backend._lock.release()
 
 
 def test_cached_decoding_uses_single_tokens_and_stream_scope_ends_before_yield(runtime):
@@ -354,6 +407,27 @@ def test_real_mlx_when_explicitly_configured():
     from mlx_lm.models.cache import make_prompt_cache
 
     backend = MLXBackend.load(source, local_files_only=True)
+    # Make the first forwards on HTTP worker threads, before a main-thread
+    # forward could materialize lazy initialization constants and mask the bug.
+    with TestClient(serve.create_app(SystemOneService(DecisionEngine(backend), "mlx-real"))) as client:
+        for stream in [False, True]:
+            response = client.post("/v1/responses", json={
+                "model": "mlx-real", "input": "Say hello.", "max_output_tokens": 4, "stream": stream,
+            })
+            assert response.status_code == 200, response.text
+            if stream:
+                events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                assert not any(event["type"] == "error" for event in events), events
+                assert events[-1]["type"] in {"response.completed", "response.incomplete"}
+            else:
+                assert response.json()["usage"]["output_tokens"] > 0
+            response = client.post("/v1/systemone", json={
+                "model": "mlx-real", "state": "Hello", "questions": {
+                    "greeting": {"type": "choice", "criteria": {"hello": "Hello", "bye": "Bye"}},
+                },
+            })
+            assert response.status_code == 200, response.text
+            assert set(response.json()["answers"]["greeting"]["probabilities"]) == {"hello", "bye"}
     generation = GenerationEngine(backend)
     prepared = generation.prepare([{"role": "user", "content": "Say hello."}], GenerationOptions(4))
     reference = generate_step(mx.array(prepared.input_ids), backend.mlx_model, stream=backend._stream,

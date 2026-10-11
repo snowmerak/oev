@@ -294,7 +294,7 @@ uv run --locked --extra mlx --extra serve oev-serve --backend mlx --model "/path
 
 For an HF repository, use `--backend mlx --model owner/model`; add `--local-files-only` to use a previously downloaded HF cache, and `--revision` to choose a revision. Online repository loading downloads the snapshot. Automatic backend selection recognizes `mlx-community/` repository IDs and local configs with MLX `quantization.bits` and `quantization.group_size`; use an explicit backend for other sources, including unquantized local MLX checkpoints. A single weight file is insufficient: the directory must include model config, tokenizer/chat template, and every weight shard.
 
-`device=auto` and `mps` use Metal; `cpu` selects MLX CPU execution. Keep `dtype=auto` to use the checkpoint's stored dtype and quantization. Selection, Responses, Chat Completions, and SSE share the same resident model. Each request gets a fresh KV cache, and inference is serialized per model even with a larger `max_concurrency`. Cancellation is checked between prompt chunks and generation forwards; pending work is synchronized before releasing the model lock. Separate registered models retain independent weights and execution streams.
+`device=auto` and `mps` use Metal; `cpu` selects MLX CPU execution. Keep `dtype=auto` to use the checkpoint's stored dtype and quantization. Selection, Responses, Chat Completions, and SSE share the same resident model. Each request gets a fresh KV cache, and inference is serialized per model even with a larger `max_concurrency`. Cancellation is checked between prompt chunks and generation forwards; pending work is synchronized before releasing the model lock. Separate registered models retain independent weights and execution streams. Each model uses an MLX stream that can be evaluated across HTTP worker threads under that lock, including lazy constants created while loading; a thread-local loading stream would cause `There is no Stream(...) in current thread` failures.
 
 The checkpoint's tokenizer chat template and EOS/end-of-turn token IDs are used. Prompts obey `max_input_tokens`; prompt plus requested output also obeys `max_position_embeddings` when declared in the config. MLX computes final-token vocabulary logits and selects the answer rows; HF's Gemma-specific projection optimization does not apply. Available architectures depend on the installed `mlx-lm` version.
 
@@ -304,7 +304,7 @@ To keep multiple MLX models loaded, copy the `mlx-local-small-metal` and `mlx-lo
 uv run --locked --extra mlx --extra serve oev-serve --models-config config.json
 ```
 
-Windows tests use a simulated MLX runtime to cover loading, cache isolation, sampling, API responses, SSE, serialization, cancellation, and failures. The following opt-in test runs real Metal inference on your Mac, comparing greedy output with `mlx-lm.generate_step`, checking selection logits against a full forward, and checking repeated requests for cache contamination:
+Windows tests use a simulated MLX runtime to cover loading, lazy initialization stream affinity across threads, cache isolation, sampling, API responses, SSE, serialization, cancellation, and failures. The following opt-in test runs real Metal inference on your Mac, first checking Responses JSON/SSE and System One on HTTP worker threads, then comparing greedy output with `mlx-lm.generate_step`, checking selection logits against a full forward, and checking repeated requests for cache contamination:
 
 ```bash
 export OEV_TEST_MLX_PATH="/path/to/mlx-model"
