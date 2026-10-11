@@ -249,10 +249,10 @@ def test_cli_config_loads_all_models_with_per_model_options_and_env_defaults(mon
     assert calls == [
         ("repo/first", {"revision": "rev-1", "device": "cpu", "dtype": "float32", "max_input_tokens": 100,
                         "backend": "auto", "local_files_only": False, "context_length": 8192,
-                        "gpu_layers": None, "chat_template": None, "flash_attn": False}),
+                        "gpu_layers": None, "chat_template": None, "flash_attn": False, "prompt_cache_max_size": 0}),
         ("repo/second", {"revision": "rev-2", "device": "hybrid-cuda", "dtype": "bfloat16", "max_input_tokens": 4096,
                          "backend": "auto", "local_files_only": False, "context_length": 8192,
-                         "gpu_layers": None, "chat_template": None, "flash_attn": False}),
+                         "gpu_layers": None, "chat_template": None, "flash_attn": False, "prompt_cache_max_size": 0}),
     ]
     assert registries[0].resolve("alpha").max_concurrency == 1
     assert registries[0].resolve("beta").max_concurrency == 3

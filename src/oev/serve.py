@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from .chat import add_chat_routes
 from .embedding_api import add_embedding_routes
@@ -21,6 +21,7 @@ from .engine import DecisionEngine, model_backend
 from .models import ModelRegistry
 from .systemone import SystemOneService
 from .types import MAX_OPTIONS
+from .prompt_cache import parse_cache_size
 
 
 Content = str | dict[str, Any] | list[Any] | None
@@ -81,6 +82,7 @@ Answer = Annotated[ChoiceAnswer | NoulAnswer | ScoreAnswer, Field(discriminator=
 class Usage(BaseModel):
     input_tokens: int
     output_tokens: int
+    input_tokens_details: dict[str, int] | None = None
 
 
 class SystemOneResponse(BaseModel):
@@ -123,7 +125,7 @@ def create_app(service: SystemOneService | EmbeddingService | ModelRegistry) -> 
     def models() -> dict[str, Any]:
         return registry.models()
 
-    @app.post("/v1/systemone", response_model=SystemOneResponse)
+    @app.post("/v1/systemone", response_model=SystemOneResponse, response_model_exclude_none=True)
     def systemone(request: SystemOneRequest) -> dict[str, Any]:
         try:
             return registry.resolve(request.model, operation="decision").evaluate(request.model_dump())
@@ -152,10 +154,30 @@ class ModelConfig(BaseModel):
     gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
     chat_template: str | None = None
     flash_attn: bool = Field(default=False, strict=True)
+    prompt_cache_max_size: int = Field(default=0, ge=0, strict=True,
+                                       validation_alias=AliasChoices("prompt_cache_max_size", "prompt_cache_max_bytes"))
     pooling: Literal["auto", "mean", "last", "cls"] = "auto"
     embedding_query_prefix: str | None = None
     embedding_document_prefix: str | None = None
     gguf_server_path: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_cache_bytes(cls, values):
+        if isinstance(values, dict) and "prompt_cache_max_bytes" in values:
+            if type(values["prompt_cache_max_bytes"]) is not int:
+                raise ValueError("prompt_cache_max_bytes must be a nonnegative integer; use prompt_cache_max_size for units")
+        return values
+
+    @field_validator("prompt_cache_max_size", mode="before", json_schema_input_type=int | str)
+    @classmethod
+    def cache_size(cls, value):
+        return parse_cache_size(value)
+
+    @property
+    def prompt_cache_max_bytes(self) -> int:
+        """Compatibility accessor; stored sizes are always normalized to bytes."""
+        return self.prompt_cache_max_size
 
     @field_validator("model", "served_model", "revision")
     @classmethod
@@ -194,7 +216,13 @@ def model_configs(args, parser) -> list[ModelConfig]:
             parser.error("provide one --served-model per --model, in the same order")
         entries = [{"model": model, "served_model": name} for model, name in zip(models, names)]
     try:
-        configs = [ModelConfig.model_validate({**defaults, **entry}) for entry in entries]
+        configs = []
+        for entry in entries:
+            values = {**defaults, **entry}
+            # An explicit legacy entry must override the CLI default too.
+            if not {"prompt_cache_max_size", "prompt_cache_max_bytes"}.intersection(entry):
+                values["prompt_cache_max_size"] = args.prompt_cache_max_size
+            configs.append(ModelConfig.model_validate(values))
     except ValidationError as exc:
         parser.error(f"invalid model configuration: {exc}")
     names = [config.name for config in configs]
@@ -206,6 +234,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
         except ValueError as exc:
             parser.error(f"model {config.name!r}: {exc}")
         gguf = backend == "gguf"
+        if config.prompt_cache_max_size and (config.task == "embedding" or config.device == "hybrid-cuda"):
+            parser.error(f"model {config.name!r}: prompt caching requires generation on HF/GGUF/MLX; hybrid-cuda is unsupported")
         if config.gguf_server_path is not None and (not gguf or config.task != "embedding"):
             parser.error(f"model {config.name!r}: gguf_server_path requires a GGUF embedding model")
         if config.task == "embedding" and config.chat_template is not None:
@@ -253,6 +283,7 @@ def _load_service(config: ModelConfig):
         backend=config.backend, local_files_only=config.local_files_only,
         context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
         flash_attn=config.flash_attn,
+        prompt_cache_max_size=config.prompt_cache_max_size,
     )
     return SystemOneService(engine, config.name, max_concurrency=config.max_concurrency)
 
@@ -275,6 +306,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
+    parser.add_argument("--prompt-cache-max-size", "--prompt-cache-max-bytes", type=parse_cache_size, default=0,
+                        help="Per-model retained prompt KV cache budget, e.g. 256MB, 256MiB, 1GB, 1GiB; 0 disables caching")
     parser.add_argument("--host", default=os.environ.get("OEV_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=os.environ.get("OEV_PORT", "8000"))
     parser.add_argument(

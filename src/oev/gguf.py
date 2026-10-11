@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import ctypes
+from dataclasses import dataclass
 from threading import Lock
+
+from .prompt_cache import PrefixCache, state_bytes
+
+
+@dataclass(frozen=True)
+class _PromptState:
+    native: bytes
+    tokens: tuple[int, ...]
 
 
 class GGUFTokenizer:
@@ -35,6 +45,60 @@ class GGUFBackend:
         self._api = api
         self._vocab = api.llama_model_get_vocab(llama.model)
         self._lock = Lock()
+        self.prompt_cache = PrefixCache()
+
+    def configure_prompt_cache(self, max_bytes):
+        with self._lock:
+            self.prompt_cache = PrefixCache(max_bytes)
+
+    def _save_prompt_state(self, input_ids, capacity):
+        buffer = (ctypes.c_uint8 * capacity)()
+        written = self._api.llama_state_get_data(self.llama.ctx, buffer, capacity)
+        if not 0 < written <= capacity:
+            raise RuntimeError("failed to save llama.cpp prompt state")
+        return _PromptState(ctypes.string_at(buffer, written), tuple(input_ids))
+
+    def _restore_prompt_state(self, snapshot):
+        buffer = (ctypes.c_uint8 * len(snapshot.native)).from_buffer_copy(snapshot.native)
+        restored = self._api.llama_state_set_data(self.llama.ctx, buffer, len(snapshot.native))
+        if restored != len(snapshot.native):
+            raise RuntimeError("failed to restore llama.cpp prompt state")
+        self.llama.input_ids[:len(snapshot.tokens)] = snapshot.tokens
+        self.llama.n_tokens = len(snapshot.tokens)
+        self.llama._requires_eval = True
+
+    def _prefill(self, input_ids, cancel=None):
+        self.llama.reset()
+        # Keep two readout tokens: quantized CPU kernels can use a different
+        # numerical path for a single-token matvec versus a batched matmul.
+        start, snapshot = self.prompt_cache.lookup(input_ids, readout_tokens=2)
+        if snapshot is not None:
+            self._restore_prompt_state(snapshot)
+        end = max(0, len(input_ids) - 2) if self.prompt_cache.max_bytes else len(input_ids)
+        while start < end:
+            if cancel is not None and cancel.is_set():
+                return False
+            stop = min(start + self.llama.n_batch, end)
+            if self.prompt_cache.max_bytes:
+                stop = min(stop, ((start // self.prompt_cache.chunk_tokens) + 1) * self.prompt_cache.chunk_tokens)
+                if stop - start == 1:
+                    break  # include this token in the final batched readout
+            self.llama.eval(input_ids[start:stop])
+            start = stop
+            if self.prompt_cache.max_bytes and (start % self.prompt_cache.chunk_tokens == 0 or start == end):
+                # Python save_state also copies a prompt-length x vocabulary
+                # scores matrix. Our sampler reads native logits, so retain only
+                # native state and tokens; the final token rebuilds the readout.
+                capacity = self._api.llama_state_get_size(self.llama.ctx)
+                prefix = input_ids[:start]
+                estimate = capacity + state_bytes(tuple(prefix)) + 1024
+                self.prompt_cache.store(prefix, None, estimate,
+                                        lambda _: self._save_prompt_state(prefix, capacity))
+        if cancel is not None and cancel.is_set():
+            return False
+        if start < len(input_ids):
+            self.llama.eval(input_ids[start:])
+        return True
 
     @classmethod
     def load(cls, source, *, device="auto", context_length=8192, gpu_layers=None, chat_template=None, flash_attn=False):
@@ -96,8 +160,7 @@ class GGUFBackend:
         self._validate_context(input_ids)
         with self._lock:
             try:
-                self.llama.reset()
-                self.llama.eval(input_ids)
+                self._prefill(input_ids)
                 logits = self._logits()
                 if not logits:
                     raise RuntimeError("llama.cpp returned no logits")
@@ -115,12 +178,8 @@ class GGUFBackend:
         else:
             return
         try:
-            self.llama.reset()
-            # Bound cancellation latency to one native prompt batch/forward.
-            for start in range(0, len(input_ids), self.llama.n_batch):
-                if cancel.is_set():
-                    return
-                self.llama.eval(input_ids[start:start + self.llama.n_batch])
+            if not self._prefill(input_ids, cancel):
+                return
             rng = np.random.default_rng()
             for index in range(options.max_new_tokens):
                 if cancel.is_set():

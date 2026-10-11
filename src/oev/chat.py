@@ -161,17 +161,20 @@ def generate(service, prepared):
 
 
 def chat_usage(result):
-    return {
+    usage = {
         "prompt_tokens": result.input_tokens, "completion_tokens": result.output_tokens,
         "total_tokens": result.input_tokens + result.output_tokens,
     }
+    if result.cached_input_tokens:
+        usage["prompt_tokens_details"] = {"cached_tokens": result.cached_input_tokens}
+    return usage
 
 
 def response_usage(result):
     return {
         "input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
         "total_tokens": result.input_tokens + result.output_tokens,
-        "input_tokens_details": {"cached_tokens": 0},
+        "input_tokens_details": {"cached_tokens": result.cached_input_tokens},
         "output_tokens_details": {"reasoning_tokens": 0},
     }
 

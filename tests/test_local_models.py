@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import json
 import os
+import pickle
 import sys
 from threading import Event
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from oev import Decision, DecisionEngine, GenerationEngine, GenerationOptions, O
 from oev.gguf import GGUFBackend
 from oev.prompt import prepare
 from oev import cli, serve
+from oev.prompt_cache import CacheUsage, track_cache
 
 
 class FakeLlama:
@@ -25,6 +27,8 @@ class FakeLlama:
         self.ctx = self
         self.n_batch = 512
         self.n_tokens = 0
+        self.input_ids = [0] * kwargs["n_ctx"]
+        self.state_saves = 0
         self.buffer = (ctypes.c_float * 256)()
         self.sequence = [ord("O"), ord("K"), ord(" "), 251]
         self.index = 0
@@ -76,6 +80,7 @@ class FakeLlama:
         self.eval_calls.append((list(tokens), self.n_tokens))
         if self.n_tokens and len(tokens) == 1:
             self.index += 1
+        self.input_ids[self.n_tokens:self.n_tokens + len(tokens)] = tokens
         self.n_tokens += len(tokens)
         for index in range(256):
             self.buffer[index] = 0
@@ -107,11 +112,75 @@ def native(monkeypatch, tmp_path):
         llama_vocab_is_eog=lambda vocab, token: token in {250, 251},
         llama_get_logits_ith=lambda ctx, row: ctypes.cast(ctx.buffer, ctypes.POINTER(ctypes.c_float)),
     )
+
+    def data(ctx):
+        return pickle.dumps((ctx.n_tokens, ctx.index, ctx.input_ids[:ctx.n_tokens]))
+
+    def save(ctx, buffer, capacity):
+        payload = data(ctx)
+        assert len(payload) <= capacity
+        ctypes.memmove(buffer, payload, len(payload))
+        ctx.state_saves += 1
+        return len(payload)
+
+    def restore(ctx, buffer, capacity):
+        count, index, tokens = pickle.loads(ctypes.string_at(buffer, capacity))
+        ctx.n_tokens, ctx.index = count, index
+        ctx.input_ids[:count] = tokens
+        return capacity
+
+    api.llama_state_get_size = lambda ctx: len(data(ctx))
+    api.llama_state_get_data = save
+    api.llama_state_set_data = restore
     monkeypatch.setitem(sys.modules, "llama_cpp", SimpleNamespace(Llama=FakeLlama, llama_cpp=api))
     monkeypatch.setitem(sys.modules, "llama_cpp.llama_chat_format", SimpleNamespace(Jinja2ChatFormatter=Formatter))
     path = tmp_path / "model.gguf"
     path.write_bytes(b"GGUF")
     return path, api
+
+
+def test_gguf_cache_restores_native_state_and_reevaluates_readout(native):
+    path, _ = native
+    backend = DecisionEngine.from_pretrained(str(path), prompt_cache_max_bytes=1024 * 1024).backend
+    ids = [2] * 550
+    first = backend.selected_logits(ids, [ord("a"), ord("b")])
+    usage = CacheUsage()
+    calls = len(backend.llama.eval_calls)
+    with track_cache(usage):
+        assert backend.selected_logits(ids, [ord("a"), ord("b")]) == first
+    assert usage.cached_tokens == len(ids) - 2
+    assert backend.llama.eval_calls[calls:][0][0] == ids[-2:]
+    expected = list(backend.generate_tokens(ids, GenerationOptions(4), Event()))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        def work(_):
+            result = list(backend.generate_tokens(ids, GenerationOptions(4), Event()))
+            assert backend.selected_logits(ids, [ord("a"), ord("b")]) == first
+            return result
+        assert list(pool.map(work, range(4))) == [expected] * 4
+    assert backend.llama.n_tokens == 0
+    assert backend.prompt_cache.size_bytes <= backend.prompt_cache.max_bytes
+    usage = CacheUsage()
+    with track_cache(usage):
+        backend.selected_logits([3] + ids[1:], [ord("b")])
+    assert usage.cached_tokens == 0
+
+
+def test_gguf_oversized_cache_is_not_allocated_and_cancel_releases_context(native):
+    path, _ = native
+    backend = GGUFBackend.load(str(path))
+    backend.configure_prompt_cache(1)
+    backend.selected_logits([2] * 550, [ord("b")])
+    assert backend.llama.state_saves == 0 and backend.prompt_cache.size_bytes == 0
+    backend.configure_prompt_cache(1024 * 1024)
+    cancel = Event()
+    source = backend.generate_tokens([2] * 550, GenerationOptions(4), cancel)
+    next(source)
+    cancel.set()
+    source.close()
+    assert backend.llama.n_tokens == 0
+    assert backend._lock.acquire(blocking=False)
+    backend._lock.release()
+    assert backend.selected_logits([2] * 550, [ord("b")]) == [2]
 
 
 def test_auto_gguf_loader_uses_native_weights_and_embedded_template(native):

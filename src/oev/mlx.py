@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 import platform
 from threading import Lock
+
+from .prompt_cache import PrefixCache, state_bytes
 
 
 class MLXBackend:
@@ -27,6 +30,21 @@ class MLXBackend:
         self._make_cache = make_cache
         self._make_sampler = make_sampler
         self._lock = Lock()
+        self.prompt_cache = PrefixCache()
+
+    def configure_prompt_cache(self, max_bytes):
+        with self._lock:
+            self.prompt_cache = PrefixCache(max_bytes)
+
+    def _clone_cache(self, cache):
+        snapshot = deepcopy(cache)
+        self._mx.eval([entry.state for entry in snapshot])
+        return snapshot
+
+    def _request_cache(self, input_ids):
+        start, snapshot = self.prompt_cache.lookup(input_ids)
+        cache = self._clone_cache(snapshot) if snapshot is not None else self._make_cache(self.mlx_model)
+        return start, cache
 
     @classmethod
     def load(cls, source, *, revision=None, device="auto", dtype="auto", local_files_only=False):
@@ -81,16 +99,22 @@ class MLXBackend:
         if self.context_window is not None and len(input_ids) + output_tokens > self.context_window:
             raise ValueError(f"prompt plus max output tokens exceeds MLX context limit {self.context_window}")
 
-    def _prefill(self, input_ids, cache, cancel=None):
+    def _prefill(self, input_ids, cache, cancel=None, start=0):
         """Evaluate bounded prompt chunks, keeping only the final token's logits."""
         mx = self._mx
         # Leave the last token for the readout, avoiding a full prompt vocabulary projection.
-        for start in range(0, len(input_ids) - 1, 512):
+        while start < len(input_ids) - 1:
             if cancel is not None and cancel.is_set():
                 return None
-            chunk = input_ids[start:min(start + 512, len(input_ids) - 1)]
+            stop = min(start + 512, len(input_ids) - 1)
+            if self.prompt_cache.max_bytes:
+                stop = min(stop, ((start // self.prompt_cache.chunk_tokens) + 1) * self.prompt_cache.chunk_tokens)
+            chunk = input_ids[start:stop]
             self.mlx_model(mx.array([chunk], dtype=mx.uint32), cache=cache)
             mx.eval([entry.state for entry in cache])
+            if self.prompt_cache.max_bytes:
+                self.prompt_cache.store(input_ids[:stop], cache, state_bytes(cache), self._clone_cache)
+            start = stop
         if cancel is not None and cancel.is_set():
             return None
         return self.mlx_model(mx.array([[input_ids[-1]]], dtype=mx.uint32), cache=cache)[:, -1, :]
@@ -101,8 +125,8 @@ class MLXBackend:
         with self._lock:
             try:
                 with mx.stream(self._stream):
-                    cache = self._make_cache(self.mlx_model)
-                    logits = self._prefill(input_ids, cache)
+                    start, cache = self._request_cache(input_ids)
+                    logits = self._prefill(input_ids, cache, start=start)
                     selected = logits[0, mx.array(answer_token_ids, dtype=mx.uint32)].astype(mx.float32)
                     mx.eval(selected)
                     return selected.tolist()
@@ -120,8 +144,8 @@ class MLXBackend:
         cache = None
         try:
             with mx.stream(self._stream):
-                cache = self._make_cache(self.mlx_model)
-                logits = self._prefill(input_ids, cache, cancel)
+                start, cache = self._request_cache(input_ids)
+                logits = self._prefill(input_ids, cache, cancel, start)
                 # Temperature is applied before top-p, matching the other backends.
                 sampler = self._make_sampler(temp=1.0, top_p=options.top_p)
             if logits is None:

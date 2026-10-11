@@ -8,6 +8,7 @@ from threading import Event
 from typing import Iterator, Protocol
 
 from .prompt import Tokenizer
+from .prompt_cache import CacheUsage, tracked_tokens
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class GenerationResult:
     input_tokens: int
     output_tokens: int
     finish_reason: str
+    cached_input_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,10 @@ def sample_tokens(forward, model, input_ids, options, cancel):
         if cancel.is_set():
             return
         with torch.inference_mode():
-            logits, cache = forward(current_ids, cache, len(input_ids) + index)
+            output = forward(current_ids, cache, len(input_ids) + index)
+            if output is None:
+                return
+            logits, cache = output
             logits = logits.float()
             if not torch.isfinite(logits).all():
                 raise RuntimeError("model returned nonfinite generation logits")
@@ -136,8 +141,9 @@ class GenerationEngine:
         eos = eos_token_ids(model) if model is not None else set()
         is_end_token = getattr(self.backend, "is_end_token", None)
         source = self.backend.generate_tokens(prepared.input_ids, prepared.options, cancel)
+        usage = CacheUsage()
         try:
-            for token in source:
+            for token in tracked_tokens(source, usage):
                 if cancel.is_set():
                     return
                 tokens.append(token)
@@ -171,7 +177,7 @@ class GenerationEngine:
             reason = "stop"
         if len(text) > len(emitted):
             yield text[len(emitted):]
-        yield GenerationResult(text, len(prepared.input_ids), len(tokens), reason)
+        yield GenerationResult(text, len(prepared.input_ids), len(tokens), reason, usage.cached_tokens)
 
     def generate(self, prepared: PreparedGeneration) -> GenerationResult:
         for event in self.stream(prepared, Event()):

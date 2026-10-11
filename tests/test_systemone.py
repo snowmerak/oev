@@ -223,7 +223,7 @@ def test_concurrent_requests_share_one_model_with_a_bounded_inference_limit():
                 self.condition.notify_all()
             try:
                 assert self.release.wait(timeout=5)
-                return SimpleNamespace(probabilities={"a": 0.25, "b": 0.75}, input_tokens=10)
+                return SimpleNamespace(probabilities={"a": 0.25, "b": 0.75}, input_tokens=10, cached_input_tokens=0)
             finally:
                 with self.condition:
                     self.active -= 1

@@ -15,6 +15,7 @@ from oev import serve
 from oev.engine import model_backend
 from oev.mlx import MLXBackend
 from oev.prompt import prepare
+from oev.prompt_cache import CacheUsage, track_cache
 
 
 class Tokenizer:
@@ -363,6 +364,52 @@ def test_windows_has_an_actionable_platform_error_before_import(monkeypatch):
         MLXBackend.load("mlx-community/model")
 
 
+def test_mlx_prefix_snapshots_reuse_and_remain_isolated_on_workers(runtime):
+    engine = DecisionEngine.from_pretrained(str(runtime.path), prompt_cache_max_bytes=1024 * 1024)
+    backend = engine.backend
+    ids = [2] * 550
+    with track_cache(CacheUsage()):
+        scores = backend.selected_logits(ids, [ord("b")])
+    entries = list(backend.prompt_cache._entries.values())
+    offsets = [snapshot[0].offset for snapshot, _ in entries]
+    calls = len(backend.mlx_model.calls)
+    usage = CacheUsage()
+    with track_cache(usage):
+        assert backend.selected_logits(ids, [ord("b")]) == scores
+    assert usage.cached_tokens == 549
+    assert len(backend.mlx_model.calls) - calls == 1
+    expected = list(backend.generate_tokens(ids, GenerationOptions(4), Event()))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        def work(_):
+            assert backend.selected_logits(ids, [ord("b")]) == scores
+            return list(backend.generate_tokens(ids, GenerationOptions(4), Event()))
+        assert list(pool.map(work, range(4))) == [expected] * 4
+    assert [snapshot[0].offset for snapshot, _ in entries] == offsets
+    assert backend.prompt_cache.size_bytes <= backend.prompt_cache.max_bytes
+    # A prefix that differs before the first stored boundary is a miss.
+    usage = CacheUsage()
+    with track_cache(usage):
+        backend.selected_logits([3] + ids[1:], [ord("b")])
+    assert usage.cached_tokens == 0
+
+
+def test_mlx_cache_cancel_and_oversized_states_do_not_leak(runtime):
+    backend = MLXBackend.load(str(runtime.path))
+    backend.configure_prompt_cache(1)
+    backend.selected_logits([2] * 550, [ord("b")])
+    assert backend.prompt_cache.size_bytes == 0
+    backend.configure_prompt_cache(1024 * 1024)
+    cancel = Event()
+    source = backend.generate_tokens([2] * 550, GenerationOptions(4), cancel)
+    next(source)
+    cancel.set()
+    source.close()
+    assert runtime.mx.current.stream is None
+    assert backend._lock.acquire(blocking=False)
+    backend._lock.release()
+    assert backend.selected_logits([2] * 550, [ord("b")]) == [3]
+
+
 def test_auto_routes_unambiguous_mlx_sources_and_explicit_hf_is_preserved(runtime):
     assert model_backend("mlx-community/model") == "mlx"
     assert model_backend(str(runtime.path)) == "mlx"
@@ -374,16 +421,21 @@ def test_auto_routes_unambiguous_mlx_sources_and_explicit_hf_is_preserved(runtim
 def test_multi_model_registry_keeps_mlx_models_resident_and_independent(runtime):
     first = MLXBackend.load(str(runtime.path))
     second = MLXBackend.load(str(runtime.path))
+    first.configure_prompt_cache(1024 * 1024)
+    second.configure_prompt_cache(2 * 1024 * 1024)
     second.mlx_model.sequence = [ord("B"), 255]
     registry = ModelRegistry([
         SystemOneService(DecisionEngine(first), "first"), SystemOneService(DecisionEngine(second), "second"),
     ])
     client = TestClient(serve.create_app(registry))
-    for name, expected in [("first", "OK "), ("second", "B"), ("first", "OK ")]:
+    for index, (name, expected) in enumerate([("first", "OK "), ("second", "B"), ("first", "OK ")]):
         result = client.post("/v1/responses", json={"model": name, "input": "Hi"}).json()
         assert result["output"][0]["content"][0]["text"] == expected
+        assert bool(result["usage"]["input_tokens_details"]["cached_tokens"]) == (index == 2)
     assert len(runtime.loaded) == 2
     assert first._stream is not second._stream
+    assert first.prompt_cache is not second.prompt_cache
+    assert second.prompt_cache.max_bytes == 2 * first.prompt_cache.max_bytes
 
 
 def test_server_loads_mlx_config_and_rejects_invalid_defaults_before_loading(runtime, monkeypatch, tmp_path):

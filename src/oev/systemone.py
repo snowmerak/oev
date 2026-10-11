@@ -196,6 +196,7 @@ class SystemOneService:
 
         answers: dict[str, dict[str, Any]] = {}
         input_tokens = 0
+        cached_input_tokens = 0
         for question in prepared:
             if question.decision is None:
                 probabilities = [1.0]
@@ -204,6 +205,7 @@ class SystemOneService:
                     result = self.engine.decide(question.decision)
                 probabilities = [result.probabilities[key] for key in question.keys]
                 input_tokens += result.input_tokens
+                cached_input_tokens += result.cached_input_tokens
             distribution = dict(zip(question.keys, probabilities))
 
             if question.kind == "noul":
@@ -225,8 +227,11 @@ class SystemOneService:
                     "probabilities": distribution,
                 }
 
+        usage = {"input_tokens": input_tokens, "output_tokens": 0}
+        if cached_input_tokens:
+            usage["input_tokens_details"] = {"cached_tokens": cached_input_tokens}
         return {
             "model": self.model,
             "answers": answers,
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            "usage": usage,
         }

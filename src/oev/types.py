@@ -55,6 +55,7 @@ class DecisionResult:
     elapsed_seconds: float
     prompt_sha256: str
     model: str
+    cached_input_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +63,7 @@ class DecisionResult:
             "probabilities": self.probabilities,
             "logits": self.logits,
             "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
             "elapsed_seconds": self.elapsed_seconds,
             "prompt_sha256": self.prompt_sha256,
             "model": self.model,

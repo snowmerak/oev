@@ -20,6 +20,7 @@
   {
     "model": "./models/hf-checkpoint",
     "served_model": "hf-local-cpu",
+    "prompt_cache_max_size": "256MiB",
     "backend": "hf",
     "local_files_only": true,
     "device": "cpu",
@@ -29,6 +30,7 @@
   {
     "model": "./models/model.Q4_K_M.gguf",
     "served_model": "gguf-local-cpu",
+    "prompt_cache_max_size": "256MiB",
     "backend": "gguf",
     "device": "cpu",
     "context_length": 8192,
@@ -38,6 +40,7 @@
   {
     "model": "./models/model.Q4_K_M.gguf",
     "served_model": "gguf-local-metal-flash-attn",
+    "prompt_cache_max_size": "256MiB",
     "backend": "gguf",
     "device": "mps",
     "flash_attn": true,
@@ -48,6 +51,7 @@
   {
     "model": "./models/mlx-small",
     "served_model": "mlx-local-small-metal",
+    "prompt_cache_max_size": "256MiB",
     "backend": "mlx",
     "device": "auto",
     "dtype": "auto",
@@ -58,6 +62,7 @@
   {
     "model": "./models/mlx-large",
     "served_model": "mlx-local-large-metal",
+    "prompt_cache_max_size": "512MiB",
     "backend": "mlx",
     "device": "auto",
     "dtype": "auto",

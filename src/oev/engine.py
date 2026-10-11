@@ -9,6 +9,7 @@ import time
 
 from .prompt import Tokenizer, prepare
 from .types import Decision, DecisionResult, conditional_softmax
+from .prompt_cache import CacheUsage, track_cache, PrefixCache, parse_cache_size
 
 
 def model_backend(source: str, backend: str = "auto") -> str:
@@ -57,9 +58,24 @@ class DecisionEngine:
         gpu_layers: int | None = None,
         chat_template: str | None = None,
         flash_attn: bool = False,
+        prompt_cache_max_size: int | str = 0,
+        prompt_cache_max_bytes: int | None = None,
     ) -> "DecisionEngine":
         if type(flash_attn) is not bool:
             raise ValueError("flash_attn must be a boolean")
+        if prompt_cache_max_bytes is not None:
+            if prompt_cache_max_size != 0:
+                raise ValueError("use only one of prompt_cache_max_size and prompt_cache_max_bytes")
+            PrefixCache(prompt_cache_max_bytes)  # legacy bytes option remains strictly integer
+            prompt_cache_max_size = prompt_cache_max_bytes
+        cache_bytes = parse_cache_size(prompt_cache_max_size)
+        if cache_bytes and device == "hybrid-cuda":
+            raise ValueError("prompt caching does not yet support hybrid-cuda; use a regular HF device")
+
+        def finish(loaded):
+            if cache_bytes:
+                loaded.configure_prompt_cache(cache_bytes)
+            return cls(loaded, max_input_tokens=max_input_tokens)
         source = str(Path(model).expanduser()) if Path(model).expanduser().exists() or model.startswith("~") else model
         selected_backend = model_backend(source, backend)
         if selected_backend == "gguf":
@@ -71,7 +87,7 @@ class DecisionEngine:
                 raise ValueError("max_input_tokens must not exceed GGUF context_length")
             loaded = GGUFBackend.load(source, device=device, context_length=context_length,
                                       gpu_layers=gpu_layers, chat_template=chat_template, flash_attn=flash_attn)
-            return cls(loaded, max_input_tokens=max_input_tokens)
+            return finish(loaded)
         if flash_attn:
             raise ValueError("flash_attn is a GGUF-only option")
         if gpu_layers is not None or chat_template is not None or context_length != 8192:
@@ -81,7 +97,7 @@ class DecisionEngine:
 
             loaded = MLXBackend.load(source, revision=revision, device=device, dtype=dtype,
                                      local_files_only=local_files_only)
-            return cls(loaded, max_input_tokens=max_input_tokens)
+            return finish(loaded)
         path = Path(source)
         if path.is_file():
             raise ValueError("the HF backend requires a model directory; use backend=gguf for .gguf files")
@@ -108,12 +124,14 @@ class DecisionEngine:
 
             backend = HuggingFaceBackend.load(source, revision=revision, device=device, dtype=dtype, **offline)
 
-        return cls(backend, max_input_tokens=max_input_tokens)
+        return finish(backend)
 
     def decide(self, decision: Decision) -> DecisionResult:
         started = time.perf_counter()
         ids, slots, prompt_hash = prepare(self.backend.tokenizer, decision, self.max_input_tokens)
-        scores = self.backend.selected_logits(ids, slots)
+        usage = CacheUsage()
+        with track_cache(usage):
+            scores = self.backend.selected_logits(ids, slots)
         if len(scores) != len(decision.options):
             raise RuntimeError("backend returned the wrong number of logits")
         probabilities = conditional_softmax(scores)
@@ -127,4 +145,5 @@ class DecisionEngine:
             elapsed_seconds=time.perf_counter() - started,
             prompt_sha256=prompt_hash,
             model=self.backend.model_name,
+            cached_input_tokens=usage.cached_tokens,
         )

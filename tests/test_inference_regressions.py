@@ -88,6 +88,18 @@ def no_full_projection(*args, **kwargs):
     raise AssertionError("full-vocabulary projection was called")
 
 
+def test_compressed_gemma_cache_runs_root_decompression_then_preserves_snapshots(monkeypatch):
+    model = gemma4_model()
+    compress(model)
+    backend = HuggingFaceBackend(model, None, "compressed-cached")
+    backend.configure_prompt_cache(1024 * 1024)
+    first = backend.selected_logits(IDS, SLOTS)
+    assert not hasattr(model, "ct_decompress_hook")
+    assert first == pytest.approx(full_logits(model), abs=1e-5)
+    monkeypatch.setattr(model.lm_head, "forward", no_full_projection)
+    assert backend.selected_logits(IDS, SLOTS) == pytest.approx(first, abs=1e-5)
+
+
 @pytest.mark.parametrize("class_name", [
     "Gemma4UnifiedForCausalLM", "Gemma4UnifiedForConditionalGeneration",
 ])

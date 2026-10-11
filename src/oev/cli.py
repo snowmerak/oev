@@ -11,6 +11,7 @@ import time
 
 from .engine import DecisionEngine
 from .io import decision_from_record, iter_jsonl
+from .prompt_cache import parse_cache_size
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
+    parser.add_argument("--prompt-cache-max-size", "--prompt-cache-max-bytes", type=parse_cache_size, default=0,
+                        help="Retained prompt KV cache budget, e.g. 256MB, 256MiB, 1GB, 1GiB; 0 disables caching")
     parser.add_argument("--input", type=Path, default=Path("examples/decisions.jsonl"))
     parser.add_argument("--output", type=Path, help="Write JSONL results here (stdout by default)")
     args = parser.parse_args(argv)
@@ -41,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         backend=args.backend, local_files_only=args.local_files_only, context_length=args.context_length,
         gpu_layers=args.gpu_layers, chat_template=args.chat_template,
         flash_attn=args.flash_attn,
+        prompt_cache_max_size=args.prompt_cache_max_size,
     )
     print(f"loaded {args.model} in {time.perf_counter() - loaded_at:.2f}s", file=sys.stderr)
 
