@@ -237,13 +237,14 @@ class GenerationRequest(APIModel):
             if self.choice() not in {"none", "auto", "required", definition["name"]}:
                 continue
             tools.append({"type": "function", "function": definition})
-        return GenerationOptions(limit, self.temperature, self.top_p, stops,
+        return GenerationOptions(limit or 256, self.temperature, self.top_p, stops,
             seed=self.seed, top_k=self.top_k, min_p=self.min_p, presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty, repetition_penalty=self.repetition_penalty,
             logit_bias={int(key): value for key, value in self.logit_bias.items()}, tools=tuple(tools),
             tool_choice=self.choice(), parallel_tool_calls=self.parallel_tool_calls,
             chat_template_kwargs=self.chat_template_kwargs,
-            reasoning_effort_explicit=("effort" in self.reasoning.model_fields_set if isinstance(self, ResponsesRequest)
+            max_new_tokens_explicit=limit is not None,
+            reasoning_effort_explicit=(("effort" in self.reasoning.model_fields_set and self.reasoning.effort is not None) if isinstance(self, ResponsesRequest)
                                        else "reasoning_effort" in self.model_fields_set), **extra)
 
 
@@ -271,7 +272,7 @@ class ChatCompletionRequest(GenerationRequest):
 
     def options(self):
         stops = (self.stop,) if isinstance(self.stop, str) else tuple(self.stop or ())
-        return self.generation_options(self.max_completion_tokens or self.max_tokens or 256, stops,
+        return self.generation_options(self.max_completion_tokens or self.max_tokens, stops,
             reasoning_effort=self.reasoning_effort, logprobs=self.logprobs, top_logprobs=self.top_logprobs,
             response_format=self.response_format.format())
 
@@ -331,7 +332,7 @@ InputItem = InputMessage | InputFunctionCall | InputFunctionOutput | InputReason
 class ResponsesRequest(GenerationRequest):
     input: str | list[InputItem]
     instructions: str | None = None
-    max_output_tokens: int = Field(default=256, ge=1, le=32768, strict=True)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=32768, strict=True)
     text: ResponseTextConfig = Field(default_factory=ResponseTextConfig)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     previous_response_id: str | None = None

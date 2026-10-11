@@ -20,7 +20,7 @@ from .api_requests import APIModel, ChatCompletionRequest, ResponsesRequest
 from .completion import parse_completion
 from .response_store import ResponseStore
 
-from .generation import GenerationOptions, GenerationResult
+from .generation import GenerationOptions, GenerationResult, ReasoningDelta, buffered_answer
 from .models import ModelCapabilityError, ModelNotFound, ModelRegistry
 
 
@@ -88,9 +88,7 @@ def completion(result, options):
 
 
 def buffered(options):
-    return bool((options.tools and options.tool_choice != "none") or options.reasoning_effort != "none"
-                or options.reasoning_parser not in {"auto", "none"}
-                or options.response_format["type"] != "text" or options.logprobs)
+    return buffered_answer(options)
 
 
 def chat_message(value):
@@ -125,13 +123,16 @@ def output_message(item_id, text="", status="completed", logprobs=()):
     }
 
 
-def response_body(body, response_id, created, item_id, result=None, options=None):
+def response_body(body, response_id, created, item_id, result=None, options=None, reasoning_id=None):
     status = "in_progress" if result is None else "incomplete" if result.finish_reason == "length" else "completed"
     output = []
+    reasoning = body.reasoning.model_dump()
+    if options:
+        reasoning["effort"] = options.reasoning_effort if not (options.thinking_enabled and options.reasoning_effort == "none") else None
     if result is not None:
         value = completion(result, options or body.options())
         if value.reasoning:
-            output.append({"id": "rs_" + uuid4().hex, "type": "reasoning", "status": status,
+            output.append({"id": reasoning_id or "rs_" + uuid4().hex, "type": "reasoning", "status": status,
                            "summary": [{"type": "summary_text", "text": value.reasoning}] if body.reasoning.summary else [],
                            "content": [{"type": "reasoning_text", "text": value.reasoning}]})
         if value.text or not value.calls:
@@ -141,16 +142,16 @@ def response_body(body, response_id, created, item_id, result=None, options=None
                            "call_id": call["id"], **call["function"]})
     return {
         "id": response_id, "object": "response", "created_at": created,
-        "completed_at": None if result is None else int(time.time()),
+        "completed_at": int(time.time()) if status == "completed" else None,
         "model": body.model, "status": status, "error": None,
         "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
         "output": output,
         "usage": None if result is None else response_usage(result),
-        "instructions": body.instructions, "max_output_tokens": body.max_output_tokens,
+        "instructions": body.instructions, "max_output_tokens": options.max_new_tokens if options else body.max_output_tokens,
         "temperature": body.temperature, "top_p": body.top_p, "store": body.store,
         "tools": body.tools, "tool_choice": body.tool_choice, "parallel_tool_calls": body.parallel_tool_calls,
         "text": body.text.model_dump(by_alias=True, exclude_none=True), "metadata": body.metadata,
-        "reasoning": body.reasoning.model_dump(), "previous_response_id": body.previous_response_id,
+        "reasoning": reasoning, "previous_response_id": body.previous_response_id,
         "truncation": body.truncation, "service_tier": "default", "background": False,
     }
 
@@ -211,6 +212,12 @@ def choice_body(result, options, index=0):
             "logprobs": {"content": visible_logprobs(result, value.text)} if options.logprobs else None}
 
 
+def remaining_output(text, emitted, channel):
+    if not text.startswith(emitted):
+        raise APIError(f"Final {channel} differs from streamed {channel}", status=502, code="invalid_model_output")
+    return text[len(emitted):]
+
+
 def aggregate_usage(results):
     usage = chat_usage(results[0])
     usage["completion_tokens"] = sum(result.output_tokens for result in results)
@@ -236,27 +243,47 @@ async def chat_stream(service, prepared, body, request, completion_id, created, 
     for index in range(body.n):
         options = replace(prepared.options, seed=(body.seed + index) % 2**64) if body.seed is not None else prepared.options
         current = replace(prepared, options=options)
+        thought, answer = "", ""
         yield sse(chunk({"role": "assistant", "content": ""}, index=index))
         async with aclosing(generation_events(service, current, request)) as events:
             async for event in events:
                 if isinstance(event, APIError):
                     yield sse(event.body())
                     return
+                if isinstance(event, ReasoningDelta):
+                    if answer:
+                        yield sse(APIError("Model opened reasoning after its answer", status=502, code="invalid_model_output").body())
+                        return
+                    thought += event.text
+                    yield sse(chunk({"reasoning_content": event.text}, index=index))
+                    continue
                 if isinstance(event, str):
                     if not buffered(options):
+                        answer += event
                         yield sse(chunk({"content": event}, index=index))
                 else:
                     try:
                         choice = choice_body(event, options, index)
+                        tail = remaining_output(choice["message"].get("reasoning_content", ""), thought, "reasoning")
+                        content_tail = remaining_output(choice["message"].get("content") or "", answer, "answer")
                     except APIError as exc:
                         yield sse(exc.body())
                         return
                     if buffered(options):
-                        delta = {key: value for key, value in choice["message"].items() if key not in {"role", "refusal", "tool_calls"} and value}
+                        delta = {key: value for key, value in choice["message"].items() if key not in {"role", "refusal", "tool_calls", "reasoning_content"} and value}
+                        if tail:
+                            delta["reasoning_content"] = tail
                         if delta or choice["logprobs"]:
                             yield sse(chunk(delta, index=index, logprobs=choice["logprobs"]))
                         for call_index, call in enumerate(choice["message"].get("tool_calls", [])):
                             yield sse(chunk({"tool_calls": [{"index": call_index, **call}]}, index=index))
+                    elif tail or content_tail:
+                        delta = {}
+                        if tail:
+                            delta["reasoning_content"] = tail
+                        if content_tail:
+                            delta["content"] = content_tail
+                        yield sse(chunk(delta, index=index))
                     results.append(event)
                     choices.append(choice)
                     yield sse(chunk({}, choice["finish_reason"], index=index))
@@ -285,27 +312,70 @@ async def responses_stream(service, prepared, body, request, response_id, create
         value = {"type": kind, "sequence_number": sequence, **fields}
         sequence += 1
         return sse(value, kind)
-    initial = response_body(body, response_id, created, item_id)
+    initial = response_body(body, response_id, created, item_id, options=prepared.options)
     yield event("response.created", response=initial)
     yield event("response.in_progress", response=initial)
     defer = buffered(prepared.options)
-    positions = {"item_id": item_id, "output_index": 0, "content_index": 0}
-    if not defer:
+    reasoning_id, thought, thought_started = "rs_" + uuid4().hex, "", False
+    answer, message_started = "", False
+
+    def thought_start():
+        positions = {"item_id": reasoning_id, "output_index": 0}
+        yield event("response.output_item.added", output_index=0,
+                    item={"id": reasoning_id, "type": "reasoning", "status": "in_progress", "summary": [], "content": []})
+        if body.reasoning.summary:
+            yield event("response.reasoning_summary_part.added", **positions, summary_index=0,
+                        part={"type": "summary_text", "text": ""})
+
+    def thought_delta(delta):
+        positions = {"item_id": reasoning_id, "output_index": 0}
+        yield event("response.reasoning_text.delta", **positions, content_index=0, delta=delta)
+        if body.reasoning.summary:
+            yield event("response.reasoning_summary_text.delta", **positions, summary_index=0, delta=delta)
+
+    def message_start(index):
+        positions = {"item_id": item_id, "output_index": index, "content_index": 0}
         item = output_message(item_id, status="in_progress")
         item["content"] = []
-        yield event("response.output_item.added", output_index=0, item=item)
+        yield event("response.output_item.added", output_index=index, item=item)
         yield event("response.content_part.added", **positions, part=output_message(item_id)["content"][0])
+
+    positions = {"item_id": item_id, "output_index": 0, "content_index": 0}
     async with aclosing(generation_events(service, prepared, request)) as events:
         async for value in events:
             if isinstance(value, APIError):
                 yield event("error", code=value.code, message=str(value), param=value.param)
                 return
+            if isinstance(value, ReasoningDelta):
+                if message_started:
+                    yield event("error", code="invalid_model_output", message="Model opened reasoning after its answer", param=None)
+                    return
+                if not thought_started:
+                    for frame in thought_start():
+                        yield frame
+                    thought_started = True
+                thought += value.text
+                for frame in thought_delta(value.text):
+                    yield frame
+                continue
             if isinstance(value, str):
-                if not defer:
+                if not defer and value:
+                    if not message_started:
+                        positions = {"item_id": item_id, "output_index": int(thought_started), "content_index": 0}
+                        for frame in message_start(positions["output_index"]):
+                            yield frame
+                        message_started = True
+                    answer += value
                     yield event("response.output_text.delta", **positions, delta=value, logprobs=[])
                 continue
             try:
-                final = response_body(body, response_id, created, item_id, value, prepared.options)
+                final = response_body(body, response_id, created, item_id, value, prepared.options, reasoning_id)
+                final_thought = next((item["content"][0]["text"] for item in final["output"] if item["type"] == "reasoning"), "")
+                remaining_output(final_thought, thought, "reasoning")
+                final_answer = next((item["content"][0]["text"] for item in final["output"] if item["type"] == "message"), "")
+                remaining_output(final_answer, answer, "answer")
+                if message_started and final_thought and not thought_started:
+                    raise APIError("Model opened reasoning after its answer", status=502, code="invalid_model_output")
                 if body.store:
                     persist(store, final, history)
             except APIError as exc:
@@ -313,14 +383,9 @@ async def responses_stream(service, prepared, body, request, response_id, create
                 return
             for output_index, item in enumerate(final["output"]):
                 positions = {"item_id": item["id"], "output_index": output_index}
-                if defer:
+                if defer and item["type"] == "function_call":
                     start = {**item, "status": "in_progress"}
-                    if item["type"] == "function_call":
-                        start["arguments"] = ""
-                    elif item["type"] == "message":
-                        start["content"] = []
-                    elif item["type"] == "reasoning":
-                        start["summary"], start["content"] = [], []
+                    start["arguments"] = ""
                     yield event("response.output_item.added", output_index=output_index, item=start)
                 if item["type"] == "function_call":
                     yield event("response.function_call_arguments.delta", **positions, delta=item["arguments"])
@@ -328,18 +393,31 @@ async def responses_stream(service, prepared, body, request, response_id, create
                 elif item["type"] == "message":
                     positions["content_index"] = 0
                     part = item["content"][0]
-                    if defer:
-                        yield event("response.content_part.added", **positions, part={**part, "text": "", "logprobs": []})
-                        yield event("response.output_text.delta", **positions, delta=part["text"], logprobs=part["logprobs"])
+                    if not message_started:
+                        for frame in message_start(output_index):
+                            yield frame
+                        message_started = True
+                    try:
+                        tail = remaining_output(part["text"], answer, "answer")
+                    except APIError as exc:
+                        yield event("error", code=exc.code, message=str(exc), param=exc.param)
+                        return
+                    if tail or part["logprobs"]:
+                        yield event("response.output_text.delta", **positions, delta=tail, logprobs=part["logprobs"])
                     yield event("response.output_text.done", **positions, text=part["text"], logprobs=part["logprobs"])
                     yield event("response.content_part.done", **positions, part=part)
                 else:
+                    if not thought_started:
+                        for frame in thought_start():
+                            yield frame
+                        thought_started = True
                     for content_index, part in enumerate(item["content"]):
-                        yield event("response.reasoning_text.delta", **positions, content_index=content_index, delta=part["text"])
+                        tail = remaining_output(part["text"], thought, "reasoning")
+                        if tail:
+                            for frame in thought_delta(tail):
+                                yield frame
                         yield event("response.reasoning_text.done", **positions, content_index=content_index, text=part["text"])
                     for summary_index, part in enumerate(item["summary"]):
-                        yield event("response.reasoning_summary_part.added", **positions, summary_index=summary_index, part={**part, "text": ""})
-                        yield event("response.reasoning_summary_text.delta", **positions, summary_index=summary_index, delta=part["text"])
                         yield event("response.reasoning_summary_text.done", **positions, summary_index=summary_index, text=part["text"])
                         yield event("response.reasoning_summary_part.done", **positions, summary_index=summary_index, part=part)
                 yield event("response.output_item.done", output_index=output_index, item=item)

@@ -216,7 +216,7 @@ def test_reasoning_configuration_precedence(defaults, body_fields, expected):
     prepared = engine.prepare(body.messages(), body.options())
     assert backend.tokenizer.kwargs["enable_thinking"] is expected
     assert backend.tokenizer.kwargs["thinking"] is expected
-    assert (prepared.options.reasoning_effort != "none") is expected
+    assert prepared.options.thinking_enabled is expected
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -359,9 +359,9 @@ def test_responses_reasoning_events_and_default_summary(summary):
     response = client.post("/v1/responses", json={"model": "one-model", "input": "Hi",
                                                  "stream": True, "reasoning": reasoning})
     events = sse_events(response)
-    assert next(event["delta"] for event in events if event["type"] == "response.reasoning_text.delta") == "Plan"
+    assert "".join(event["delta"] for event in events if event["type"] == "response.reasoning_text.delta") == "Plan"
     summaries = [event for event in events if event["type"] == "response.reasoning_summary_text.delta"]
-    assert len(summaries) == (1 if summary else 0)
+    assert "".join(event["delta"] for event in summaries) == ("Plan" if summary else "")
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "Plan"
 
 

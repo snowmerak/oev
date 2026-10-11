@@ -5,6 +5,7 @@ No inference-framework imports are needed to interpret decoded model text.
 """
 
 import ast
+from functools import lru_cache
 import json
 import re
 
@@ -67,6 +68,12 @@ TURN_TOKENS = (
     "<|end|>", "<|turn>", "<turn|>", "<end_of_turn>", "<eos>", "</s>",
     "<｜end▁of▁sentence｜>", "<|fim_suffix|>", "<|return|>",
 )
+RESPONSE_MARKERS = (
+    "<|channel>final\n", "<channel|>",
+    "<|end|><|start|>assistant<|channel|>final<|message|>",
+    "<|start|>assistant<|channel|>final<|message|>",
+    "<|channel|>final<|message|>", "<|START_RESPONSE|>", "<|END_RESPONSE|>",
+)
 HARMONY_TOOL_HEADER = re.compile(
     r"(?:<\|start\|>assistant)?(?:\s*to=([\w.-]+)(?:<\|channel\|>(?:commentary|analysis|final))?"
     r"|<\|channel\|>(?:commentary|analysis|final)\s+to=([\w.-]+))"
@@ -124,11 +131,27 @@ def detect_tool_parser(template):
     return "auto"
 
 
+def detect_reasoning_parser(template):
+    for family, opening, _ in REASONING_MARKERS:
+        if opening.rstrip() in template:
+            return family
+    # Native templates can concatenate the channel name at render time.
+    if "<|channel>" in template and "thought" in template:
+        return "gemma4"
+    if "<|channel|>" in template and "analysis" in template:
+        return "harmony"
+    return "auto"
+
+
 def split_reasoning(text, profile="auto"):
     """Keep native thoughts separate; tool start can implicitly end thinking."""
     profile = parser_name(profile, reasoning=True)
     if profile == "none":
         return text, ""
+    candidate = strip_turn_tokens(text).lstrip()
+    openings = tuple(opening for family, opening, _ in REASONING_MARKERS if profile in {"auto", family})
+    if candidate.startswith(("{", "[")) and not candidate.startswith(openings):
+        return text, ""  # Includes an unfinished JSON string at a token limit.
     try:
         json_value(_json_candidate(text))
     except ValueError:
@@ -168,7 +191,121 @@ def split_reasoning(text, profile="auto"):
     if profile in {"auto", "cohere"}:
         text = re.sub(r"^\s*<\|START_RESPONSE\|>", "", text)
         text = re.sub(r"<\|END_RESPONSE\|>\s*$", "", text)
-    return text, "\n\n".join(thought for thought in thoughts if thought)
+    return text, "\n\n".join(strip_turn_tokens(thought).strip() for thought in thoughts if thought)
+
+
+@lru_cache(maxsize=64)
+def _protocol_prefixes(markers, minimum):
+    return tuple(sorted({marker[:length] for marker in markers for length in range(minimum, len(marker))},
+                        key=len, reverse=True))
+
+
+def hold_protocol_suffix(text, markers, minimum=1):
+    """Withhold an unfinished control marker, including tokens split by decode."""
+    size = next((len(prefix) for prefix in _protocol_prefixes(tuple(markers), minimum) if text.endswith(prefix)), 0)
+    return text[:-size] if size else text
+
+
+class ReasoningAccumulator:
+    """Stream only an unambiguous leading native thought channel.
+
+    Answers and tool arguments still require final validation. In particular,
+    strings containing protocol markers inside JSON must never become thoughts.
+    Cumulative decoding lets us hold split markers and incomplete UTF-8 without
+    retokenizing model output or depending on any inference runtime.
+    """
+
+    def __init__(self, profile, prefix="", stops=(), enabled=False):
+        self.profile = parser_name(profile, reasoning=True)
+        self.enabled = self.profile != "none" and (self.profile != "auto" or enabled)
+        self.prefix, self.stops, self.emitted = prefix, stops, ""
+        self.openings = tuple(opening for family, opening, _ in REASONING_MARKERS
+                              if self.profile in {"auto", family})
+        self.markers = tuple(marker for family, opening, closing in REASONING_MARKERS
+                             if self.profile in {"auto", family} for marker in (opening, closing)) + TOOL_STARTS + TURN_TOKENS
+
+    def advance(self, raw):
+        if not self.enabled:
+            return ""
+        candidate = raw.lstrip()
+        if self.profile == "harmony":
+            candidate = candidate.removeprefix("<|start|>assistant")
+        if not self.prefix and not candidate.startswith(self.openings):
+            return ""
+        ends = [raw.find(stop) for stop in self.stops if stop in raw]
+        if ends:
+            raw = raw[:min(ends)]
+        raw = hold_protocol_suffix(raw, self.markers + self.stops)
+        if "\ufffd" in raw:
+            raw = raw[:raw.index("\ufffd")]
+        _, thought = split_reasoning(raw, self.profile)
+        if not thought.startswith(self.emitted):
+            raise ValueError("native reasoning changed after it was streamed")
+        delta = thought[len(self.emitted):]
+        self.emitted = thought
+        return delta
+
+
+class OutputAccumulator(ReasoningAccumulator):
+    """Route native thought and answer channels without leaking split markers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.markers += tuple("<|start|>assistant" + opening for opening in self.openings
+                              if opening.startswith("<|channel|>"))
+        self.answer = ""
+
+    def advance(self, raw):
+        thought = super().advance(raw)
+        ends = [raw.find(stop) for stop in self.stops if stop in raw]
+        if ends:
+            raw = raw[:min(ends)]
+        raw = hold_protocol_suffix(raw, self.markers + RESPONSE_MARKERS + self.stops)
+        if "\ufffd" in raw:
+            raw = raw[:raw.index("\ufffd")]
+        text, reasoning = split_reasoning(raw, self.profile)
+        text = strip_turn_tokens(text)
+        if reasoning:
+            text = text.lstrip()
+        text = text.rstrip()  # Final parsing decides whether trailing whitespace survives.
+        if not text.startswith(self.answer):
+            raise ValueError("native answer changed after it was streamed")
+        delta = text[len(self.answer):]
+        self.answer = text
+        return delta, thought
+
+
+def truncated_output(text, profile="auto", *, structured=False):
+    """Keep partial prose, but never expose a cut-off call as executable output.
+
+    Even an earlier complete call in a length-limited turn is withheld: clients
+    must resolve the incomplete response before executing its proposed actions.
+    """
+    candidate = text.lstrip()
+    if structured and candidate.startswith(("{", "[")):
+        return text
+    json_call = re.match(r'^\s*(?:\[\s*)?\{\s*"(?:name|function|arguments)"\s*:', candidate)
+    json_function = re.match(r'^\s*(?:\[\s*)?\{\s*"type"\s*:\s*"function"', candidate)
+    if json_call or json_function:
+        return ""
+    if candidate.startswith(("{", "[")):
+        # A JSON answer may contain tag-looking string data. Only recognized
+        # call envelopes or a forced Python call format are protocol here.
+        if parser_name(profile) == "pythonic" and re.match(r"\[\s*[\w.]+\(", candidate):
+            return ""
+        try:
+            if _call_envelopes(json_value(candidate)):
+                return ""
+        except ValueError:
+            pass
+        return text
+    if parser_name(profile) == "pythonic" and re.match(r"[\w.]+\(", candidate):
+        return ""
+    boundary = _tool_boundary(text)
+    for marker in ("<function=", "<|python_tag|>", "<|tools_prefix|>"):
+        if marker in text:
+            boundary = min(boundary, text.index(marker))
+    return hold_protocol_suffix(text[:boundary], TOOL_STARTS + ("<function=",), minimum=2)
 
 
 def strip_turn_tokens(text):

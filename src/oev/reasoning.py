@@ -94,16 +94,15 @@ def template_controls(template):
 def reasoning_metadata(template, parser, defaults):
     if parser == "none":
         return {"supported": False}
-    known = parser != "auto" or any(
-        opening.rstrip() in template for _, opening, _ in REASONING_MARKERS
-    )
+    from .output_parsers import detect_reasoning_parser
+    known = parser != "auto" or detect_reasoning_parser(template) != "auto"
     if not known:
         return None
     levels, toggle, effort = template_controls(template)
     result = {"supported": True}
     if levels:
         result.update(control="effort", supported_efforts=list(levels))
-        default = defaults["reasoning_effort"] if defaults["enable_thinking"] else "none"
+        default = defaults.get("reasoning_effort") if defaults["enable_thinking"] else "none"
         if default in levels:
             result["default_effort"] = default
     elif toggle:

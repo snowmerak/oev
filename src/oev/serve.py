@@ -148,6 +148,7 @@ class ModelConfig(BaseModel):
     dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
     max_input_tokens: int = Field(default=4096, ge=1, strict=True)
     max_concurrency: int = Field(default=4, ge=1, strict=True)
+    default_max_output_tokens: int = Field(default=8192, ge=1, le=32768, strict=True)
     backend: Literal["auto", "hf", "gguf", "mlx"] = "auto"
     local_files_only: bool = Field(default=False, strict=True)
     context_length: int = Field(default=8192, ge=1, strict=True)
@@ -213,6 +214,7 @@ def model_configs(args, parser) -> list[ModelConfig]:
         "task": args.task,
         "revision": args.revision, "device": args.device, "dtype": args.dtype,
         "max_input_tokens": args.max_input_tokens, "max_concurrency": args.max_concurrency,
+        "default_max_output_tokens": getattr(args, "default_max_output_tokens", 8192),
         "backend": args.backend, "local_files_only": args.local_files_only,
         "context_length": args.context_length, "gpu_layers": args.gpu_layers, "chat_template": args.chat_template,
         "flash_attn": args.flash_attn,
@@ -314,6 +316,7 @@ def _load_service(config: ModelConfig):
         engine, config.name, max_concurrency=config.max_concurrency,
         tool_call_parser=config.tool_call_parser, reasoning_parser=config.reasoning_parser,
         chat_template_kwargs=config.chat_template_kwargs, chat_template=template,
+        default_max_output_tokens=config.default_max_output_tokens,
     )
 
 
@@ -326,6 +329,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--reasoning-parser", default="auto", help="Model reasoning protocol, e.g. qwen3, gemma4, deepseek-r1")
     parser.add_argument("--chat-template-kwargs", type=json.loads, default={},
                         help="JSON object of model-specific template options; per-model JSON config can override it")
+    parser.add_argument("--default-max-output-tokens", type=int, default=8192,
+                        help="Generation budget when the request omits its output limit (default: 8192; capped by remaining context)")
     parser.add_argument("--task", choices=["generation", "embedding"], default="generation",
                         help="Default model task; JSON entries can override it")
     parser.add_argument("--revision", help="Hugging Face commit revision")

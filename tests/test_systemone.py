@@ -154,6 +154,7 @@ def test_http_contract_and_validation_before_inference():
             "id": "oev-test", "object": "model", "created": 0, "owned_by": "oev",
             "task": "generation", "max_input_tokens": 100_000,
             "context_length": 100_000, "max_output_tokens": 32768,
+            "default_max_output_tokens": 8192,
             "tool_call_parser": "auto",
         }],
         "models": [

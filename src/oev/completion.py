@@ -7,7 +7,8 @@ import re
 from uuid import uuid4
 
 from .output_parsers import (
-    json_value, parameter_value, parse_tool_calls, split_reasoning, strip_turn_tokens, template_text,
+    REASONING_MARKERS, TOOL_STARTS, hold_protocol_suffix, json_value, parameter_value,
+    parse_tool_calls, split_reasoning, strip_turn_tokens, template_text, truncated_output,
 )
 
 
@@ -176,14 +177,20 @@ def parse_completion(result, options):
     raw = result.raw_text if result.raw_text is not None else result.text
     reasoning = ""
     active_tools = options.tools and options.tool_choice != "none"
+    truncated = result.finish_reason == "length"
+    if truncated and not raw.lstrip().startswith(("{", "[")):
+        markers = tuple(marker for _, opening, closing in REASONING_MARKERS for marker in (opening, closing)) + TOOL_STARTS
+        raw = hold_protocol_suffix(raw, markers, minimum=2)
     if options.reasoning_parser != "none" and (
-        options.reasoning_effort != "none" or active_tools
+        options.reasoning_effort != "none" or options.thinking_enabled or active_tools
         or options.reasoning_parser != "auto"
     ):
         raw, reasoning = split_reasoning(raw, options.reasoning_parser)
     # Harmony reasoning needs its end marker before turn-token cleanup.
     calls = []
-    if active_tools:
+    if active_tools and truncated:
+        raw = truncated_output(raw, options.tool_call_parser, structured=options.response_format["type"] != "text")
+    elif active_tools:
         def gemma(content, escape='<|"|>'):
             found = re.match(r"(?:call:)?([\w.-]+)\s*", content)
             if not found:

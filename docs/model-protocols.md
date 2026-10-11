@@ -90,12 +90,34 @@ Reasoning usage counts generated token ranges, including pre-opened thought
 blocks, and stops before tool arguments. Effort is passed to the template along
 with `enable_thinking` and `thinking`. Actual level semantics depend on
 the checkpoint; models with only a toggle do not gain calibrated reasoning
-budgets. `none` / `minimal` disable thinking by default.
+budgets. `none` disables thinking; `minimal` enables it (Sharp maps it to `low`).
+An omitted effort is left undefined in the native template rather than injecting
+an unsupported level. Server thinking flags default to false. Enabling a thinking
+flag explicitly removes an earlier `none`/`off` effort so the template can use its
+own native level. Parsing also detects thought prefixes opened by the rendered
+prompt, even when the caller did not request an effort.
 
-Plain text streams incrementally. Tool/reasoning/structured-output streams
-remain buffered until generation finishes. Incremental protocol parsing,
-grammar-constrained generation and per-tool argument deltas during generation
-are not introduced by this change.
+Plain text and leading native thought/answer channels stream incrementally on
+HF, GGUF and MLX. Split control markers and unfinished UTF-8 are held back;
+thoughts never become answer deltas. Chat sends `reasoning_content`; Responses
+sends native reasoning and, when requested, mirrored summary deltas. Final output
+must match the text already streamed, and item IDs remain stable until completion.
+Already delivered thoughts survive a later inference or validation failure.
+
+Tool calls, structured answers and logprobs remain buffered for final validation;
+their preceding thoughts still stream. Per-tool argument deltas during inference
+and grammar-constrained decoding are not implemented. Late reasoning after an
+answer has started is not a supported native channel order.
+
+A request without an output limit uses `default_max_output_tokens` (8,192), capped
+by the remaining native context. Explicit limits are honored, including the
+reasoning tokens consumed before an answer or call. Exhaustion emits
+`response.incomplete` with `response.incomplete_details.reason="max_output_tokens"`,
+as defined by the [Responses event schema](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_incomplete_event.py).
+It preserves partial prose/thoughts and withholds proposed calls; required-call
+validation applies to completed turns. Clients must read the nested details
+rather than expecting an error message at the event's top level. See the
+[investigation and verification report](../reports/responses-reasoning-20261012.md).
 
 ## Configuration
 
@@ -107,6 +129,7 @@ Use per-model configuration to select unwrapped formats or customize a template:
   "model": "./models/qwen3.8-27b.gguf",
   "served_model": "qwen3.8-27b",
   "backend": "gguf",
+  "default_max_output_tokens": 8192,
   "tool_call_parser": "qwen3_coder",
   "reasoning_parser": "qwen3",
   "chat_template_kwargs": {
@@ -127,7 +150,7 @@ template kwargs. Callers cannot replace messages, tool definitions, the
 template source or rendering controls through this field. Leading consecutive
 system/developer instructions are merged for templates requiring one system turn.
 
-`GET /v1/models` advertises `max_input_tokens`, `max_output_tokens`,
+`GET /v1/models` advertises `max_input_tokens`, `max_output_tokens`, `default_max_output_tokens`,
 the selected tool protocol, task, and discoverable reasoning controls.
 Reasoning output parsing does not establish effort support. Templates using only
 thinking flags advertise `control="toggle"` and `default_enabled`, without an

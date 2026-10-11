@@ -9,7 +9,7 @@ from threading import BoundedSemaphore, Event
 from typing import Any, Iterator, Mapping
 
 from .engine import DecisionEngine
-from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration, template_options
+from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration, ReasoningDelta, template_options
 from .output_parsers import detect_tool_parser, parser_name, template_text
 from .reasoning import reasoning_metadata
 from .types import Decision, MAX_OPTIONS, Option
@@ -135,6 +135,7 @@ class SystemOneService:
         reasoning_parser: str = "auto",
         chat_template_kwargs: dict | None = None,
         chat_template: str | None = None,
+        default_max_output_tokens: int = 8192,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
@@ -148,6 +149,7 @@ class SystemOneService:
         self._generation_options = {
             "tool_call_parser": tool_call_parser, "reasoning_parser": reasoning_parser,
             "chat_template_kwargs": chat_template_kwargs, "chat_template": chat_template,
+            "default_max_output_tokens": default_max_output_tokens,
         }
 
     def _generation_engine(self):
@@ -165,7 +167,7 @@ class SystemOneService:
 
     def stream_generation(
         self, prepared: PreparedGeneration, cancel: Event,
-    ) -> Iterator[str | GenerationResult]:
+    ) -> Iterator[str | ReasoningDelta | GenerationResult]:
         # A disconnected request can leave the queue without taking a slot.
         while not cancel.is_set():
             if self._inference_slots.acquire(timeout=0.1):
@@ -200,6 +202,7 @@ class SystemOneService:
         metadata = {"task": "generation", "max_input_tokens": self.engine.max_input_tokens,
                     "max_output_tokens": min(32768, context - 1) if context else 32768,
                     "context_length": min(context, self.engine.max_input_tokens) if context else self.engine.max_input_tokens}
+        metadata["default_max_output_tokens"] = min(self._generation_options["default_max_output_tokens"], context - 1) if context else self._generation_options["default_max_output_tokens"]
         if context:
             metadata["context_window"] = context
         template = self._generation_options["chat_template"] or template_text(backend.tokenizer)

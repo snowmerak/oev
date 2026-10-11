@@ -13,7 +13,7 @@ from typing import Iterator, Protocol
 from .prompt import Tokenizer
 from .prompt_cache import CacheUsage, tracked_tokens
 from .output_parsers import (
-    REASONING_MARKERS, TOOL_STARTS, detect_tool_parser, parser_name, template_text,
+    REASONING_MARKERS, TOOL_STARTS, detect_reasoning_parser, detect_tool_parser, parser_name, split_reasoning, template_text,
 )
 
 
@@ -42,6 +42,8 @@ class GenerationOptions:
     chat_template_kwargs: dict = field(default_factory=dict)
     chat_template: str | None = None
     reasoning_effort_explicit: bool = False
+    max_new_tokens_explicit: bool = True
+    thinking_enabled: bool = False
 
     def __post_init__(self):
         parser_name(self.tool_call_parser)
@@ -82,10 +84,22 @@ class GenerationResult:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    """Native thought text, emitted independently of answer/tool buffering."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedGeneration:
     input_ids: list[int]
     options: GenerationOptions
     reasoning_prefix: str = ""
+
+
+def buffered_answer(options):
+    return bool((options.tools and options.tool_choice != "none")
+                or options.response_format["type"] != "text" or options.logprobs)
 
 
 def validate_template_kwargs(values):
@@ -110,15 +124,22 @@ def validate_template_kwargs(values):
 def template_options(effort, defaults, overrides, explicit):
     def apply(target, values):
         if "reasoning_effort" in values:
-            enabled = values["reasoning_effort"] not in {"none", "minimal", "off"}
+            enabled = values["reasoning_effort"] not in {"none", "off"}
             target.update(enable_thinking=enabled, thinking=enabled)
         target.update(values)
         if "enable_thinking" in values:
             target["thinking"] = values["enable_thinking"]
         elif "thinking" in values:
             target["enable_thinking"] = values["thinking"]
-    enabled = effort not in {"none", "minimal"}
-    requested = {"reasoning_effort": effort, "enable_thinking": enabled, "thinking": enabled}
+        if (target["enable_thinking"] and target.get("reasoning_effort") in {"none", "off"}
+                and ("enable_thinking" in values or "thinking" in values)):
+            # An explicit toggle supersedes an earlier disabled effort. Leave
+            # the level undefined so the native template chooses its default.
+            target.pop("reasoning_effort", None)
+    enabled = effort not in {"none", "off"}
+    requested = {"enable_thinking": enabled, "thinking": enabled}
+    if explicit:
+        requested["reasoning_effort"] = effort
     kwargs = requested.copy()
     apply(kwargs, defaults)
     if explicit:
@@ -180,21 +201,23 @@ def reasoning_token_count(tokens, tokenizer, prefix):
         if not start_marker or not end_marker:
             continue
         active = prefix == opening
+        in_tools = False
         index = 0
         while index < len(tokens):
-            if tokens[index:index + len(start_marker)] == start_marker:
+            boundary = next((marker for marker in boundaries if marker and
+                             tokens[index:index + len(marker)] == marker), None) if not in_tools else None
+            if boundary:
+                active = False
+                in_tools = True
+                index += len(boundary)
+                continue
+            if not in_tools and tokens[index:index + len(start_marker)] == start_marker:
                 active = True
                 index += len(start_marker)
             elif tokens[index:index + len(end_marker)] == end_marker:
                 active = False
                 index += len(end_marker)
             else:
-                boundary = next((marker for marker in boundaries if marker and
-                                 tokens[index:index + len(marker)] == marker), None) if active else None
-                if boundary:
-                    active = False
-                    index += len(boundary)
-                    continue
                 count += int(active)
                 index += 1
     return count
@@ -256,7 +279,7 @@ def sample_tokens(forward, model, input_ids, options, cancel):
 class GenerationEngine:
     def __init__(self, backend: GenerationBackend, *, max_input_tokens: int = 4096,
                  tool_call_parser="auto", reasoning_parser="auto", chat_template_kwargs=None,
-                 chat_template=None):
+                 chat_template=None, default_max_output_tokens=8192):
         self.backend = backend
         self.max_input_tokens = max_input_tokens
         self.tool_call_parser = parser_name(tool_call_parser)
@@ -264,6 +287,9 @@ class GenerationEngine:
         self.chat_template_kwargs = chat_template_kwargs or {}
         validate_template_kwargs(self.chat_template_kwargs)
         self.chat_template = chat_template
+        if type(default_max_output_tokens) is not int or not 1 <= default_max_output_tokens <= 32768:
+            raise ValueError("default_max_output_tokens must be between 1 and 32768")
+        self.default_max_output_tokens = default_max_output_tokens
 
     def prepare(self, messages: list[dict], options: GenerationOptions) -> PreparedGeneration:
         if not callable(getattr(self.backend, "generate_tokens", None)):
@@ -290,17 +316,12 @@ class GenerationEngine:
                                   options.chat_template_kwargs,
                                   options.reasoning_effort_explicit or options.reasoning_effort != "none")
         thinking = kwargs["enable_thinking"]
-        if reasoning_parser == "auto" and (thinking or (options.tools and options.tool_choice != "none")):
-            for family, opening, _ in REASONING_MARKERS:
-                if opening in template or (family == "gemma4" and "<|channel>thought" in template):
-                    reasoning_parser = family
-                    break
-        effort = kwargs["reasoning_effort"] if thinking else "none"
-        if thinking and effort in {"none", "minimal", "off"}:
-            effort = "low"
+        if reasoning_parser == "auto":
+            reasoning_parser = detect_reasoning_parser(template)
+        effort = kwargs.get("reasoning_effort", "none") if thinking else "none"
         options = replace(options, tool_call_parser=tool_parser, reasoning_parser=reasoning_parser,
                           chat_template=self.chat_template or options.chat_template,
-                          reasoning_effort=effort)
+                          reasoning_effort=effort, thinking_enabled=thinking)
         normalized = prompt_messages(normalized, options, self.backend.tokenizer)
         if options.tools and options.tool_choice != "none":
             if tool_parser == "none":
@@ -326,12 +347,22 @@ class GenerationEngine:
         context = getattr(self.backend, "context_window", None)
         if context is None and model is not None:
             context = getattr(model.config.get_text_config(), "max_position_embeddings", None)
+        if not options.max_new_tokens_explicit:
+            budget = min(self.default_max_output_tokens, context - len(ids)) if context else self.default_max_output_tokens
+            if budget < 1:
+                raise ValueError("prompt leaves no room for output in the model context")
+            options = replace(options, max_new_tokens=budget)
         if context is not None and len(ids) + options.max_new_tokens > context:
             raise ValueError(f"prompt plus max output tokens exceeds model context limit {context}")
         prefix = next((opening for _, opening, _ in REASONING_MARKERS if prompt.rstrip().endswith(opening.rstrip())), "")
+        if prefix and options.reasoning_parser == "auto":
+            options = replace(options, reasoning_parser=next(family for family, opening, _ in REASONING_MARKERS if opening == prefix))
+        if prefix:
+            options = replace(options, thinking_enabled=True)
         return PreparedGeneration(ids, options, prefix)
 
-    def stream(self, prepared: PreparedGeneration, cancel: Event) -> Iterator[str | GenerationResult]:
+    def stream(self, prepared: PreparedGeneration, cancel: Event) -> Iterator[str | ReasoningDelta | GenerationResult]:
+        from .output_parsers import OutputAccumulator, ReasoningAccumulator
         tokens: list[int] = []
         token_logprobs = []
         emitted = ""
@@ -344,6 +375,11 @@ class GenerationEngine:
         is_end_token = getattr(self.backend, "is_end_token", None)
         source = self.backend.generate_tokens(prepared.input_ids, prepared.options, cancel)
         usage = CacheUsage()
+        defer = buffered_answer(prepared.options)
+        accumulator = ReasoningAccumulator if defer else OutputAccumulator
+        protocol = accumulator(prepared.options.reasoning_parser, prepared.reasoning_prefix, stops,
+                               prepared.options.thinking_enabled or bool(prepared.options.tools and prepared.options.tool_choice != "none"))
+        stream_protocol = protocol.enabled and not defer
         try:
             for token in tracked_tokens(source, usage):
                 if cancel.is_set():
@@ -356,6 +392,18 @@ class GenerationEngine:
                 text = self.backend.tokenizer.decode(
                     tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False,
                 )
+                if protocol.enabled:
+                    raw = prepared.reasoning_prefix + self.backend.tokenizer.decode(
+                        tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False,
+                    )
+                    if stream_protocol:
+                        answer, delta = protocol.advance(raw)
+                    else:
+                        delta = protocol.advance(raw)
+                    if delta:
+                        yield ReasoningDelta(delta)
+                    if stream_protocol and answer:
+                        yield answer
                 matches = [text.find(stop) for stop in stops if stop in text]
                 if matches:
                     text = text[:min(matches)]
@@ -370,7 +418,7 @@ class GenerationEngine:
                 if replacement >= 0:
                     ready = min(ready, replacement)
                 ready = min(ready, max(0, len(text) - holdback))
-                if ready > len(emitted):
+                if not stream_protocol and ready > len(emitted):
                     yield text[len(emitted):ready]
                     emitted = text[:ready]
         finally:
@@ -381,7 +429,7 @@ class GenerationEngine:
             return
         if len(tokens) < prepared.options.max_new_tokens:
             reason = "stop"
-        if len(text) > len(emitted):
+        if not stream_protocol and len(text) > len(emitted):
             yield text[len(emitted):]
         # Gemma's tool-call closing marker is also an EOS token. Keep control
         # markers for protocol parsing; display text already excludes EOS.
@@ -391,7 +439,8 @@ class GenerationEngine:
             if matches:
                 raw_text = raw_text[:min(matches)]
         content_tokens = tokens[:-1] if tokens and (tokens[-1] in eos or (is_end_token and is_end_token(tokens[-1]))) else tokens
-        reasoning_tokens = reasoning_token_count(content_tokens, self.backend.tokenizer, prepared.reasoning_prefix) if prepared.options.reasoning_effort != "none" else 0
+        has_thought = prepared.options.reasoning_parser != "none" and bool(split_reasoning(raw_text, prepared.options.reasoning_parser)[1])
+        reasoning_tokens = reasoning_token_count(content_tokens, self.backend.tokenizer, prepared.reasoning_prefix) if has_thought else 0
         yield GenerationResult(text, len(prepared.input_ids), len(tokens), reason, usage.cached_tokens, raw_text, tuple(token_logprobs), reasoning_tokens)
 
     def generate(self, prepared: PreparedGeneration) -> GenerationResult:
