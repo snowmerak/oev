@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .generation import GenerationOptions, GenerationResult
-from .systemone import SystemOneService
+from .models import ModelNotFound, ModelRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -309,7 +309,13 @@ async def responses_stream(service, prepared, body, request, response_id, create
                 return
 
 
-def add_chat_routes(app: FastAPI, service: SystemOneService):
+def add_chat_routes(app: FastAPI, registry: ModelRegistry):
+    def resolve(model):
+        try:
+            return registry.resolve(model)
+        except ModelNotFound as exc:
+            raise APIError(str(exc), status=404, code="model_not_found", param="model") from exc
+
     @app.exception_handler(APIError)
     async def api_error(request, exc):
         return JSONResponse(exc.body(), status_code=exc.status)
@@ -324,6 +330,7 @@ def add_chat_routes(app: FastAPI, service: SystemOneService):
 
     @app.post("/v1/chat/completions")
     def chat_completions(body: ChatCompletionRequest, request: Request):
+        service = resolve(body.model)
         prepared = prepare(service, body.model, [item.message() for item in body.messages], body.options())
         completion_id, created = f"chatcmpl-{uuid4().hex}", int(time.time())
         if body.stream:
@@ -341,6 +348,7 @@ def add_chat_routes(app: FastAPI, service: SystemOneService):
 
     @app.post("/v1/responses")
     def responses(body: ResponsesRequest, request: Request):
+        service = resolve(body.model)
         prepared = prepare(service, body.model, body.messages(), body.options())
         response_id, item_id, created = f"resp_{uuid4().hex}", f"msg_{uuid4().hex}", int(time.time())
         if body.stream:

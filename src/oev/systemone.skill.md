@@ -19,14 +19,16 @@ Do not use it for open-ended generation, fact retrieval, tool execution, or cali
 
 ## Workflow
 
-1. Send `GET /v1/models` to discover the exact model name accepted by this server.
+1. Send `GET /v1/models` to discover the exact model names accepted by this server and select one.
 2. Send `POST /v1/systemone` with that model name, one nonempty `state`, and one or more named questions.
 3. Match each entry in `answers` to the same key in `questions`.
 4. Treat probabilities and confidence values as relative signals over the supplied criteria, not as calibrated correctness probabilities.
 
 Use the same origin that served this document. The built-in local server does not require an API key, though a deployment proxy may add authentication.
 
-For open-ended text, this server also exposes `POST /v1/responses` and `POST /v1/chat/completions`, using the same loaded model. Both support text messages and SSE streaming. Responses accepts `model`, `input`, optional `instructions`, and `max_output_tokens`; Chat Completions accepts `model`, `messages`, and `max_completion_tokens`. Generation is stateless, so resend conversation history. Tools, images/audio, and structured-output constraints are unsupported. `GET /v1/models` also returns an OpenAI-compatible `data` array; the existing `models` array below remains available. Generation validation uses HTTP `400`; System One uses HTTP `422`.
+For open-ended text, this server also exposes `POST /v1/responses` and `POST /v1/chat/completions`, using the selected model's existing loaded backend. Both support text messages and SSE streaming. Responses accepts `model`, `input`, optional `instructions`, and `max_output_tokens`; Chat Completions accepts `model`, `messages`, and `max_completion_tokens`. Generation is stateless, so resend conversation history. Tools, images/audio, and structured-output constraints are unsupported. `GET /v1/models` also returns an OpenAI-compatible `data` array; the existing `models` array below remains available. Generation validation uses HTTP `400`; System One uses HTTP `422`.
+
+The server may keep multiple models loaded. Both model lists contain every served name in configuration order. Choose any listed name for each request; different requests may use different models, including generation and selection. Within one model, generation and decisions share its backend and concurrency limit. Each model has an independent limit. An unknown name returns HTTP `422` for System One or HTTP `404` with `model_not_found` for generation.
 
 ## Discover the model
 
@@ -46,7 +48,7 @@ GET /v1/models
 }
 ```
 
-Copy `models[0].name` into the request's `model` field. Do not assume the example name is configured on every server.
+Copy the selected entry's `name` from `models` (or its `id` from `data`) into the request's `model` field. Do not assume the example name is configured on every server.
 
 ## Evaluate questions
 

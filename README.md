@@ -106,7 +106,7 @@ $env:OEV_MAX_CONCURRENCY = "4"
 uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --device hybrid-cuda --dtype bfloat16
 ```
 
-`OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads the model once and allows up to four simultaneous inferences by default, shared across decisions and text generation. A generation holds one slot until it finishes or cancellation is observed. Questions within one decision request run sequentially, and requests wait when the concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length and generation KV caches.
+`OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads each configured model once and allows up to four simultaneous inferences **per model** by default, shared across that model's decisions and text generation. A generation holds one slot until it finishes or cancellation is observed. Questions within one decision request run sequentially, and requests wait when their model's concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length and generation KV caches.
 
 The default device is `auto`. The example explicitly selects `hybrid-cuda` for a 6 GB CUDA GPU. This mode requires Gemma 4 and a CUDA GPU with bfloat16 support.
 
@@ -128,11 +128,59 @@ All questions in a request share the same `state`, and oev runs the model once p
 
 `confidence` summarizes how concentrated the probability distribution is. For `choice`, it uses `(max probability − 1/K) / (1 − 1/K)`; for `score`, it uses the average distance from the most probable level. These values are not calibrated probabilities of correctness, so thresholds for automated actions should be validated on actual application data. `usage.input_tokens` sums the prompt tokens across questions, and `usage.output_tokens` is zero because no tokens are generated. The default server provides no authentication; use authentication and TLS in front of it when exposing it externally.
 
+## Multiple resident models
+
+Repeat `--model` to keep multiple models loaded in the same process. Every request selects a loaded model through its required `model` field, across System One, Responses, and Chat Completions, including streaming. The loading options apply to all models unless overridden in a config file.
+
+```powershell
+uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --model google/gemma-4-E4B-it --device cpu --dtype bfloat16
+```
+
+Model IDs or local paths are served as their names by default. To assign aliases, supply one `--served-model` per `--model`, in the same order:
+
+```powershell
+uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --served-model fast --model google/gemma-4-E4B-it --served-model large --device cpu --dtype bfloat16
+```
+
+For different devices, revisions, or limits, use `--models-config` with a nonempty JSON array. See [examples/models.json](examples/models.json) for a hybrid-CUDA model alongside a CPU model:
+
+```json
+[
+  {"model": "google/gemma-4-E2B-it", "served_model": "fast", "device": "hybrid-cuda", "dtype": "bfloat16", "max_concurrency": 1},
+  {"model": "google/gemma-4-E4B-it", "served_model": "large", "device": "cpu", "dtype": "bfloat16", "max_input_tokens": 8192, "max_concurrency": 2}
+]
+```
+
+```powershell
+uv run --locked --extra hf --extra serve oev-serve --models-config examples/models.json
+```
+
+Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, and `max_concurrency`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
+
+`GET /v1/models` lists all served names in configuration order in both `models` and `data`. For example, use `model="fast"` for a decision and `model="large"` for a generated reply. An unknown name returns `422` for System One or `404` with `model_not_found` for generation, before any inference.
+
+All models finish loading before HTTP starts and remain resident until the process exits. A loading failure prevents the server from starting. Models have independent inference limits, so one model's occupied slots do not block another; total concurrency can reach the sum of their limits. RAM/VRAM must accommodate all loaded weights and active KV caches together. There is no automatic eviction or runtime load/unload API.
+
+You can also register already-loaded Python services:
+
+```python
+from oev import DecisionEngine, ModelRegistry, SystemOneService
+from oev.serve import create_app
+
+registry = ModelRegistry([
+    SystemOneService(DecisionEngine.from_pretrained("google/gemma-4-E2B-it", device="cpu"), "fast", max_concurrency=1),
+    SystemOneService(DecisionEngine.from_pretrained("google/gemma-4-E4B-it", device="cpu"), "large", max_concurrency=2),
+])
+app = create_app(registry)
+```
+
+`create_app(single_service)` remains supported. The registry retains the supplied services and routes to them without loading additional model copies.
+
 ## Responses and Chat Completions
 
-The same `oev-serve` process exposes `POST /v1/responses` and `POST /v1/chat/completions`. These implement the text-generation subset of the [OpenAI API formats](https://developers.openai.com/api/docs/guides/migrate-to-responses). There is no second model load. HF and `hybrid-cuda` backends both support generation, and each request owns a separate KV cache. Decision requests still use their optimized next-token readout.
+The same `oev-serve` process exposes `POST /v1/responses` and `POST /v1/chat/completions`. These implement the text-generation subset of the [OpenAI API formats](https://developers.openai.com/api/docs/guides/migrate-to-responses). Generation uses the selected model's existing decision backend without another model load. HF and `hybrid-cuda` backends both support generation, and each request owns a separate KV cache. Decision requests still use their optimized next-token readout.
 
-`GET /v1/models` includes the OpenAI-compatible `object` and `data` fields alongside the existing System One `models` array. Both lists describe the same served model name.
+`GET /v1/models` includes the OpenAI-compatible `object` and `data` fields alongside the existing System One `models` array. Both lists describe the same set of served model names.
 
 With an OpenAI Python SDK installed in your client environment:
 
