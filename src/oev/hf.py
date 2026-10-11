@@ -30,7 +30,8 @@ class HuggingFaceBackend:
 
     @classmethod
     def load(
-        cls, source: str, *, revision: str | None = None, device: str = "auto", dtype: str = "auto"
+        cls, source: str, *, revision: str | None = None, device: str = "auto", dtype: str = "auto",
+        local_files_only: bool = False,
     ) -> "HuggingFaceBackend":
         try:
             import torch
@@ -48,7 +49,7 @@ class HuggingFaceBackend:
             raise ValueError("MPS is unavailable")
         if dtype not in {"auto", "float32", "float16", "bfloat16"}:
             raise ValueError("dtype must be auto, float32, float16, or bfloat16")
-        common = {"revision": revision, "trust_remote_code": False}
+        common = {"revision": revision, "trust_remote_code": False, "local_files_only": local_files_only}
         tokenizer = AutoTokenizer.from_pretrained(source, **common)
         model = AutoModelForCausalLM.from_pretrained(
             source,

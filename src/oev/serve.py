@@ -133,6 +133,11 @@ class ModelConfig(BaseModel):
     dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
     max_input_tokens: int = Field(default=4096, ge=1, strict=True)
     max_concurrency: int = Field(default=4, ge=1, strict=True)
+    backend: Literal["auto", "hf", "gguf"] = "auto"
+    local_files_only: bool = Field(default=False, strict=True)
+    context_length: int = Field(default=8192, ge=1, strict=True)
+    gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
+    chat_template: str | None = None
 
     @field_validator("model", "served_model", "revision")
     @classmethod
@@ -150,6 +155,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
     defaults = {
         "revision": args.revision, "device": args.device, "dtype": args.dtype,
         "max_input_tokens": args.max_input_tokens, "max_concurrency": args.max_concurrency,
+        "backend": args.backend, "local_files_only": args.local_files_only,
+        "context_length": args.context_length, "gpu_layers": args.gpu_layers, "chat_template": args.chat_template,
     }
     if args.models_config:
         if args.model or args.served_model:
@@ -174,6 +181,18 @@ def model_configs(args, parser) -> list[ModelConfig]:
     if len(set(names)) != len(names):
         parser.error("served model names must be unique")
     for config in configs:
+        gguf = config.backend == "gguf" or (config.backend == "auto" and Path(config.model).suffix.lower() == ".gguf")
+        if gguf:
+            if config.dtype != "auto" or config.revision is not None or config.device == "hybrid-cuda":
+                parser.error(f"model {config.name!r}: GGUF does not accept dtype, revision, or hybrid-cuda")
+            if config.max_input_tokens > config.context_length:
+                parser.error(f"model {config.name!r}: max_input_tokens exceeds GGUF context_length")
+            if config.device == "cpu" and config.gpu_layers not in {None, 0}:
+                parser.error(f"model {config.name!r}: device=cpu requires gpu_layers=0")
+            if config.device in {"cuda", "mps"} and config.gpu_layers == 0:
+                parser.error(f"model {config.name!r}: a GPU device requires nonzero gpu_layers")
+        elif config.gpu_layers is not None or config.chat_template is not None or config.context_length != 8192:
+            parser.error(f"model {config.name!r}: context_length, gpu_layers, and chat_template are GGUF-only")
         if config.device == "hybrid-cuda" and config.dtype not in {"auto", "bfloat16"}:
             parser.error(f"model {config.name!r}: hybrid-cuda requires bfloat16")
     return configs
@@ -185,6 +204,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--served-model", action="append", help="API model name; repeat once per --model, in the same order")
     parser.add_argument("--models-config", help="JSON array with per-model loading options")
     parser.add_argument("--revision", help="Hugging Face commit revision")
+    parser.add_argument("--backend", choices=["auto", "hf", "gguf"], default="auto", help="Auto detects .gguf file paths; other sources use HF")
+    parser.add_argument("--local-files-only", action="store_true", help="HF: use downloaded files/cache without network access")
+    parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size, including generated tokens")
+    parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all; auto/cpu defaults to 0")
+    parser.add_argument("--chat-template", help="GGUF: override embedded chat template with a Jinja file")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
@@ -210,6 +234,8 @@ def main(argv: list[str] | None = None) -> None:
         engine = DecisionEngine.from_pretrained(
             config.model, revision=config.revision, device=config.device, dtype=config.dtype,
             max_input_tokens=config.max_input_tokens,
+            backend=config.backend, local_files_only=config.local_files_only,
+            context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
         )
         services.append(SystemOneService(engine, config.name, max_concurrency=config.max_concurrency))
     service = services[0] if len(services) == 1 else ModelRegistry(services)

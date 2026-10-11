@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Protocol
+from pathlib import Path
+import json
 import time
 
 from .prompt import Tokenizer, prepare
@@ -30,17 +32,53 @@ class DecisionEngine:
         device: str = "auto",
         dtype: str = "auto",
         max_input_tokens: int = 4096,
+        backend: str = "auto",
+        local_files_only: bool = False,
+        context_length: int = 8192,
+        gpu_layers: int | None = None,
+        chat_template: str | None = None,
     ) -> "DecisionEngine":
+        source = str(Path(model).expanduser()) if Path(model).expanduser().exists() or model.startswith("~") else model
+        if backend not in {"auto", "hf", "gguf"}:
+            raise ValueError("backend must be auto, hf, or gguf")
+        use_gguf = backend == "gguf" or (backend == "auto" and Path(source).suffix.lower() == ".gguf")
+        if use_gguf:
+            from .gguf import GGUFBackend
+
+            if revision is not None or dtype != "auto":
+                raise ValueError("GGUF files do not accept revision or dtype; quantization is stored in the file")
+            if max_input_tokens > context_length:
+                raise ValueError("max_input_tokens must not exceed GGUF context_length")
+            loaded = GGUFBackend.load(source, device=device, context_length=context_length,
+                                      gpu_layers=gpu_layers, chat_template=chat_template)
+            return cls(loaded, max_input_tokens=max_input_tokens)
+        if gpu_layers is not None or chat_template is not None or context_length != 8192:
+            raise ValueError("context_length, gpu_layers, and chat_template are GGUF-only options")
+        path = Path(source)
+        if path.is_file():
+            raise ValueError("the HF backend requires a model directory; use backend=gguf for .gguf files")
+        if path.is_dir():
+            # Local folders should never fall back to fetching missing files.
+            local_files_only = True
+            if not (path / "config.json").is_file() and any(path.glob("*.gguf")):
+                raise ValueError("pass a specific .gguf file, not its download directory")
+            config_path = path / "config.json"
+            if config_path.is_file():
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                quantization = config.get("quantization")
+                if isinstance(quantization, dict) and "bits" in quantization and "group_size" in quantization:
+                    raise ValueError("MLX-quantized checkpoints are unsupported; use a Transformers checkpoint or a GGUF file")
+        offline = {"local_files_only": True} if local_files_only else {}
         if device == "hybrid-cuda":
             from .hybrid import HybridGemma4Backend
 
             if dtype not in {"auto", "bfloat16"}:
                 raise ValueError("hybrid-cuda requires bfloat16")
-            backend = HybridGemma4Backend.load(model, revision=revision)
+            backend = HybridGemma4Backend.load(source, revision=revision, **offline)
         else:
             from .hf import HuggingFaceBackend
 
-            backend = HuggingFaceBackend.load(model, revision=revision, device=device, dtype=dtype)
+            backend = HuggingFaceBackend.load(source, revision=revision, device=device, dtype=dtype, **offline)
 
         return cls(backend, max_input_tokens=max_input_tokens)
 

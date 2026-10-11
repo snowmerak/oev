@@ -17,6 +17,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read option logits from one model forward pass per decision")
     parser.add_argument("--model", default="google/gemma-4-E2B-it", help="Hugging Face model ID or local path")
     parser.add_argument("--revision", help="Hugging Face commit revision for reproducible runs")
+    parser.add_argument("--backend", choices=["auto", "hf", "gguf"], default="auto")
+    parser.add_argument("--local-files-only", action="store_true", help="HF: load downloaded files/cache offline")
+    parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size including output tokens")
+    parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all")
+    parser.add_argument("--chat-template", help="GGUF chat template override (Jinja file)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
@@ -31,6 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         dtype=args.dtype,
         max_input_tokens=args.max_input_tokens,
+        backend=args.backend, local_files_only=args.local_files_only, context_length=args.context_length,
+        gpu_layers=args.gpu_layers, chat_template=args.chat_template,
     )
     print(f"loaded {args.model} in {time.perf_counter() - loaded_at:.2f}s", file=sys.stderr)
 

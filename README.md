@@ -155,7 +155,7 @@ For different devices, revisions, or limits, use `--models-config` with a nonemp
 uv run --locked --extra hf --extra serve oev-serve --models-config examples/models.json
 ```
 
-Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, and `max_concurrency`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
+Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, `max_concurrency`, `backend`, `local_files_only`, `context_length`, `gpu_layers`, and `chat_template`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
 
 `GET /v1/models` lists all served names in configuration order in both `models` and `data`. For example, use `model="fast"` for a decision and `model="large"` for a generated reply. An unknown name returns `422` for System One or `404` with `model_not_found` for generation, before any inference.
 
@@ -175,6 +175,68 @@ app = create_app(registry)
 ```
 
 `create_app(single_service)` remains supported. The registry retains the supplied services and routes to them without loading additional model copies.
+
+## Downloaded models and offline loading
+
+The downloader does not determine the backend: the downloaded **file format** does.
+
+| Downloaded format | Model source | Backend |
+| --- | --- | --- |
+| Transformers checkpoint | Directory with config, tokenizer/chat template, and all weight files; or a cached HF repository ID | `hf` (default for non-GGUF sources) |
+| GGUF text model | Path to a specific `.gguf` file, including an LM Studio download | `gguf` (auto-detected by file extension) |
+| MLX quantized checkpoint | MLX directory | Unsupported; obtain a Transformers checkpoint or GGUF instead |
+
+### `hf download`
+
+[HF's CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli) can download a complete repository into a directory:
+
+```powershell
+hf download google/gemma-4-E2B-it --local-dir ./models/gemma4
+uv run --locked --extra hf --extra serve oev-serve --model ./models/gemma4 --served-model gemma-local --device cpu --dtype bfloat16 --local-files-only
+```
+
+A local checkpoint directory automatically uses `local_files_only=True`, including `hybrid-cuda`; missing files fail instead of being fetched. You may also pass the snapshot directory printed by `hf download`, or pass the original repository ID with `--local-files-only` to use the HF cache. A directory needs the complete tokenizer, model config, and all weight shards. Downloading only a `.safetensors` file is insufficient. `~` is expanded in local model paths.
+
+### `lms get` and other GGUF downloads
+
+[`lms get`](https://lmstudio.ai/docs/cli/local-models/get) can download GGUF models; [`lms ls --json`](https://lmstudio.ai/docs/cli/local-models/ls) lists downloaded models. Locate the actual `.gguf` file under your configured LM Studio model directory and pass its local path. Remote LM Link model identifiers are not local file paths. GGUF files downloaded with `hf download` work the same way.
+
+```powershell
+uv sync --locked --extra gguf --extra serve
+uv run --locked --extra gguf --extra serve oev-serve --model "C:/path/to/model.Q4_K_M.gguf" --served-model gguf-local --device cpu --context-length 8192
+```
+
+GGUF support uses the optional [llama-cpp-python runtime](https://llama-cpp-python.readthedocs.io/en/latest/), which must support the model's architecture. Installing this extra may require a native compiler; GPU offload requires a build for your GPU backend. It loads quantized weights directly without converting them to Transformers weights. Selection, Responses, Chat Completions, and SSE all reuse that loaded instance.
+
+GGUF `device=auto` defaults to CPU. Set `gpu_layers`/`--gpu-layers` to the number of layers to offload, or `-1` for all, with a GPU-capable runtime. `device=cuda` or `mps` requests all layers by default; the installed native runtime determines the GPU backend. `device=cpu` requires zero offloaded layers. `context_length` defaults to 8,192 and includes prompt plus requested output. The GGUF's quantization determines its weight type, so `dtype` must remain `auto`; `revision` and `hybrid-cuda` are HF-only. `context_length`, `gpu_layers`, and `chat_template` are GGUF-only options.
+
+The model's embedded Jinja chat template is used with `enable_thinking=False`. If absent, provide `--chat-template path/to/chat.jinja` (or `chat_template` in JSON) with the correct template. The same exact single-token answer-label and prompt-boundary validation applies to GGUF decisions; incompatible tokenizers fail clearly. All native end-of-generation tokens, including end-of-turn markers, stop generation and count toward usage without appearing in output text.
+
+One GGUF instance owns one mutable native KV context. Requests to that instance are serialized internally, even if `max_concurrency` is larger than one; different models can still run independently. Cancellation is observed between prompt batches and generation forwards, and closing a stream resets the context and releases its lock. GGUF selection computes the native full vocabulary logits and reads the requested answer tokens; HF's Gemma-specific projection optimization does not apply to this backend.
+
+To mix offline HF and GGUF models, edit the paths in [examples/models-local.json](examples/models-local.json), then run:
+
+```powershell
+uv run --locked --extra hf --extra gguf --extra serve oev-serve --models-config examples/models-local.json
+```
+
+Relative paths are resolved from the server's working directory. No automatic LM Studio model scanning, model downloading, or MLX runtime is added. LM Studio need not run for direct local GGUF loading.
+
+The Python loader accepts the same settings:
+
+```python
+engine = DecisionEngine.from_pretrained("C:/path/to/model.gguf", backend="gguf", context_length=8192)
+offline = DecisionEngine.from_pretrained("./models/gemma4", local_files_only=True, device="cpu")
+```
+
+Tests exercise an actual saved/reloaded tiny Transformers checkpoint offline and GGUF routing, native-context serialization, cancellation, stop tokens, and error handling with a simulated native runtime. To exercise your installed llama.cpp runtime and an actual downloaded text GGUF:
+
+```powershell
+$env:OEV_TEST_GGUF_PATH = "C:/path/to/model.gguf"
+uv run --locked --extra gguf --extra serve --extra test python -m pytest -q tests/test_local_models.py::test_real_downloaded_gguf_when_explicitly_configured
+```
+
+Without that environment variable, the real GGUF test is skipped; simulated tests do not establish compatibility with every GGUF architecture.
 
 ## Responses and Chat Completions
 

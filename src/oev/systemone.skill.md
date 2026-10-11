@@ -30,6 +30,8 @@ For open-ended text, this server also exposes `POST /v1/responses` and `POST /v1
 
 The server may keep multiple models loaded. Both model lists contain every served name in configuration order. Choose any listed name for each request; different requests may use different models, including generation and selection. Within one model, generation and decisions share its backend and concurrency limit. Each model has an independent limit. An unknown name returns HTTP `422` for System One or HTTP `404` with `model_not_found` for generation.
 
+Served models can come from HF repositories, downloaded Transformers directories, or local GGUF files, depending on server configuration. Select the served alias from `/v1/models`; clients do not send filesystem paths unless that path itself is the served name. A GGUF model serializes its native inference context internally while other registered models remain independent.
+
 ## Discover the model
 
 ```http

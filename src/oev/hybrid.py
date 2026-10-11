@@ -33,7 +33,7 @@ class HybridGemma4Backend:
         self.cuda_weight_bytes = torch.cuda.memory_allocated()
 
     @classmethod
-    def load(cls, source: str, *, revision: str | None = None) -> "HybridGemma4Backend":
+    def load(cls, source: str, *, revision: str | None = None, local_files_only: bool = False) -> "HybridGemma4Backend":
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -42,7 +42,7 @@ class HybridGemma4Backend:
 
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
             raise ValueError("hybrid-cuda requires a CUDA GPU with bfloat16 support")
-        common = {"revision": revision, "trust_remote_code": False}
+        common = {"revision": revision, "trust_remote_code": False, "local_files_only": local_files_only}
         tokenizer = AutoTokenizer.from_pretrained(source, **common)
         model = AutoModelForCausalLM.from_pretrained(
             source, dtype=torch.bfloat16, device_map="cpu", low_cpu_mem_usage=True, **common

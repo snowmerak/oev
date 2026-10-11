@@ -118,7 +118,9 @@ class GenerationEngine:
         if not ids or len(ids) > self.max_input_tokens:
             raise ValueError(f"prompt has {len(ids)} tokens; limit is {self.max_input_tokens}; truncation is disabled")
         model = getattr(self.backend, "model", None)
-        context = getattr(model.config.get_text_config(), "max_position_embeddings", None) if model is not None else None
+        context = getattr(self.backend, "context_window", None)
+        if context is None and model is not None:
+            context = getattr(model.config.get_text_config(), "max_position_embeddings", None)
         if context is not None and len(ids) + options.max_new_tokens > context:
             raise ValueError(f"prompt plus max output tokens exceeds model context limit {context}")
         return PreparedGeneration(ids, options)
@@ -132,6 +134,7 @@ class GenerationEngine:
         holdback = max((len(item) - 1 for item in stops), default=0)
         model = getattr(self.backend, "model", None)
         eos = eos_token_ids(model) if model is not None else set()
+        is_end_token = getattr(self.backend, "is_end_token", None)
         source = self.backend.generate_tokens(prepared.input_ids, prepared.options, cancel)
         try:
             for token in source:
@@ -146,7 +149,7 @@ class GenerationEngine:
                     text = text[:min(matches)]
                     reason = "stop"
                     break
-                if token in eos:
+                if token in eos or (is_end_token is not None and is_end_token(token)):
                     reason = "stop"
                     break
                 # Buffer incomplete words/UTF-8 and possible stop prefixes.

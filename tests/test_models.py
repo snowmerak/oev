@@ -247,8 +247,12 @@ def test_cli_config_loads_all_models_with_per_model_options_and_env_defaults(mon
     monkeypatch.setattr(serve, "create_app", lambda registry: registries.append(registry) or registry)
     serve.main(["--models-config", str(config), "--dtype", "bfloat16", "--revision", "rev-1"])
     assert calls == [
-        ("repo/first", {"revision": "rev-1", "device": "cpu", "dtype": "float32", "max_input_tokens": 100}),
-        ("repo/second", {"revision": "rev-2", "device": "hybrid-cuda", "dtype": "bfloat16", "max_input_tokens": 4096}),
+        ("repo/first", {"revision": "rev-1", "device": "cpu", "dtype": "float32", "max_input_tokens": 100,
+                        "backend": "auto", "local_files_only": False, "context_length": 8192,
+                        "gpu_layers": None, "chat_template": None}),
+        ("repo/second", {"revision": "rev-2", "device": "hybrid-cuda", "dtype": "bfloat16", "max_input_tokens": 4096,
+                         "backend": "auto", "local_files_only": False, "context_length": 8192,
+                         "gpu_layers": None, "chat_template": None}),
     ]
     assert registries[0].resolve("alpha").max_concurrency == 1
     assert registries[0].resolve("beta").max_concurrency == 3
