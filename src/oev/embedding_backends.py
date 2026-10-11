@@ -8,6 +8,7 @@ import platform
 from threading import Lock
 
 from .engine import model_backend
+from .hf_embedding_metadata import local_pooling_defaults, pooling_loader
 
 
 def _check_tokens(counts, limit):
@@ -48,7 +49,8 @@ class HFEmbeddingBackend:
             config_kwargs = {"vision_config": None, "audio_config": None}
             if dtype == "auto":
                 dtype = "float32"
-        model = SentenceTransformer(
+        loader = pooling_loader(SentenceTransformer, local_pooling_defaults(path, config))
+        model = loader(
             source, device=None if device == "auto" else device, revision=revision,
             local_files_only=offline, trust_remote_code=False,
             model_kwargs={"torch_dtype": "auto" if dtype == "auto" else getattr(torch, dtype)},

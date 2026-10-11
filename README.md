@@ -221,6 +221,8 @@ Register an embedding checkpoint with `"task": "embedding"` in the same `--model
 
 For HF models install the `embeddings` extra (Sentence Transformers 6.1 and Transformers 5.18+). Native checkpoint pooling, normalization modules, and projection heads are retained. [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) uses last-token pooling; [EmbeddingGemma2](https://huggingface.co/google/embeddinggemma-2) has a learned projection head and requires float32 or bfloat16. HF EmbeddingGemma2 loads text only, omitting vision/audio encoders; `dtype=auto` uses float32 for that architecture. Complete local directories and offline HF cache loading work as for generation models.
 
+If a local checkpoint has `modules.json` but its referenced pooling config is absent, oev supplies native pooling defaults in memory for Qwen3-Embedding-0.6B/4B/8B (last-token pooling, identified by the original directory or HF cache name) and EmbeddingGemma2 (mean pooling with the projected `embedding_dim`). Existing configs take priority; model files are never rewritten and no network download is attempted. Unknown models or multiple pooling modules require restoring the original metadata. This only repairs missing pooling configs: weights, tokenizer/processor files, projection heads, and `modules.json` must still be complete.
+
 Copy the embedding examples you need from [examples/models.json](examples/models.json) into your existing `config.json`. To mix HF embedding models with MLX and GGUF generation models on Mac:
 
 ```bash
