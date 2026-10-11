@@ -47,8 +47,9 @@ class ModelRegistry:
             ],
             "object": "list",
             "data": [
-                {"id": name, "object": "model", "created": 0, "owned_by": "oev"}
-                for name in self._services
+                {"id": name, "object": "model", "created": 0, "owned_by": "oev",
+                 **(service.model_metadata() if isinstance(service, SystemOneService) else {"task": "embedding"})}
+                for name, service in self._services.items()
             ],
         }
 

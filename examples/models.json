@@ -128,5 +128,21 @@
     "embedding_document_prefix": "",
     "max_input_tokens": 4096,
     "max_concurrency": 1
+  },
+  {
+    "model": "./models/qwen3.8-27b.gguf",
+    "served_model": "gguf-qwen3-xml-tools",
+    "backend": "gguf",
+    "device": "mps",
+    "flash_attn": true,
+    "context_length": 131072,
+    "max_input_tokens": 32768,
+    "max_concurrency": 1,
+    "prompt_cache_max_size": "2GiB",
+    "tool_call_parser": "qwen3_coder",
+    "reasoning_parser": "qwen3",
+    "chat_template_kwargs": {
+      "terse": false
+    }
   }
 ]

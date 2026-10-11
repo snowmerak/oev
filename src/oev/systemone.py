@@ -9,7 +9,8 @@ from threading import BoundedSemaphore, Event
 from typing import Any, Iterator, Mapping
 
 from .engine import DecisionEngine
-from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration
+from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration, template_options
+from .output_parsers import REASONING_MARKERS, detect_tool_parser, parser_name, template_text
 from .types import Decision, MAX_OPTIONS, Option
 
 
@@ -129,6 +130,10 @@ class SystemOneService:
         *,
         release_date: str | None = None,
         max_concurrency: int = 4,
+        tool_call_parser: str = "auto",
+        reasoning_parser: str = "auto",
+        chat_template_kwargs: dict | None = None,
+        chat_template: str | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
@@ -139,22 +144,27 @@ class SystemOneService:
         self.release_date = release_date or date.today().isoformat()
         self.max_concurrency = max_concurrency
         self._inference_slots = BoundedSemaphore(max_concurrency)
+        self._generation_options = {
+            "tool_call_parser": tool_call_parser, "reasoning_parser": reasoning_parser,
+            "chat_template_kwargs": chat_template_kwargs, "chat_template": chat_template,
+        }
+
+    def _generation_engine(self):
+        return GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens,
+                                **self._generation_options)
 
     def prepare_generation(
         self, messages: list[dict[str, str]], options: GenerationOptions,
     ) -> PreparedGeneration:
-        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
-        return engine.prepare(messages, options)
+        return self._generation_engine().prepare(messages, options)
 
     def generate(self, prepared: PreparedGeneration) -> GenerationResult:
-        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
         with self._inference_slots:
-            return engine.generate(prepared)
+            return self._generation_engine().generate(prepared)
 
     def stream_generation(
         self, prepared: PreparedGeneration, cancel: Event,
     ) -> Iterator[str | GenerationResult]:
-        engine = GenerationEngine(self.engine.backend, max_input_tokens=self.engine.max_input_tokens)
         # A disconnected request can leave the queue without taking a slot.
         while not cancel.is_set():
             if self._inference_slots.acquire(timeout=0.1):
@@ -162,7 +172,7 @@ class SystemOneService:
         else:
             return
         try:
-            yield from engine.stream(prepared, cancel)
+            yield from self._generation_engine().stream(prepared, cancel)
         finally:
             self._inference_slots.release()
 
@@ -179,6 +189,38 @@ class SystemOneService:
                 }
             ]
         }
+
+    def model_metadata(self) -> dict[str, Any]:
+        backend = self.engine.backend
+        context = getattr(backend, "context_window", None)
+        model = getattr(backend, "model", None)
+        if context is None and model is not None:
+            context = getattr(model.config.get_text_config(), "max_position_embeddings", None)
+        metadata = {"task": "generation", "max_input_tokens": self.engine.max_input_tokens,
+                    "max_output_tokens": min(32768, context - 1) if context else 32768,
+                    "context_length": min(context, self.engine.max_input_tokens) if context else self.engine.max_input_tokens}
+        if context:
+            metadata["context_window"] = context
+        template = self._generation_options["chat_template"] or template_text(backend.tokenizer)
+        profile = parser_name(self._generation_options["tool_call_parser"])
+        metadata["tool_call_parser"] = detect_tool_parser(template) if profile == "auto" else profile
+        reasoning = parser_name(self._generation_options["reasoning_parser"], reasoning=True)
+        known = reasoning not in {"auto", "none"} or (reasoning == "auto" and any(
+            opening.rstrip() in template for _, opening, _ in REASONING_MARKERS
+        ))
+        if known:
+            defaults = template_options("none", self._generation_options["chat_template_kwargs"] or {}, {}, False)
+            effort = defaults["reasoning_effort"] if defaults["enable_thinking"] else "none"
+            if defaults["enable_thinking"] and effort in {"none", "minimal", "off"}:
+                effort = "low"
+            metadata["capabilities"] = {"reasoning": {
+                "supported": True, "control": "effort",
+                "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "default_effort": effort,
+            }}
+        elif reasoning == "none":
+            metadata["capabilities"] = {"reasoning": {"supported": False}}
+        return metadata
 
     def evaluate(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):

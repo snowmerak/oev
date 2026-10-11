@@ -46,6 +46,19 @@ class ChatMessage(APIModel):
     reasoning_content: str | None = None
     refusal: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reasoning_aliases(cls, values):
+        if isinstance(values, dict):
+            values = values.copy()
+            for key in ("reasoning", "thinking"):
+                if key in values:
+                    thought = values.pop(key)
+                    if "reasoning_content" in values and values["reasoning_content"] != thought:
+                        raise ValueError("conflicting assistant reasoning fields")
+                    values["reasoning_content"] = thought
+        return values
+
     @model_validator(mode="after")
     def validate_role(self):
         if self.tool_calls and self.role != "assistant":
@@ -124,7 +137,7 @@ class ResponseTextConfig(APIModel):
 
 class ReasoningConfig(APIModel):
     effort: Effort | None = "none"
-    summary: Literal["auto", "concise", "detailed"] | None = None
+    summary: Literal["auto", "concise", "detailed"] | None = "auto"
 
 
 class GenerationRequest(APIModel):
@@ -151,6 +164,7 @@ class GenerationRequest(APIModel):
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in-memory"] | None = None
     service_tier: Literal["auto", "default"] | None = None
+    chat_template_kwargs: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -159,7 +173,7 @@ class GenerationRequest(APIModel):
             value = value.copy()
             for key in ("temperature", "top_p", "stream", "store", "tools", "tool_choice", "parallel_tool_calls",
                         "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty",
-                        "logit_bias", "metadata", "n", "response_format", "reasoning_effort", "logprobs",
+                        "logit_bias", "metadata", "chat_template_kwargs", "n", "response_format", "reasoning_effort", "logprobs",
                         "top_logprobs", "text", "reasoning", "include", "max_output_tokens", "truncation", "background"):
                 if key in cls.model_fields and key in value and value[key] is None:
                     value.pop(key)
@@ -227,7 +241,10 @@ class GenerationRequest(APIModel):
             seed=self.seed, top_k=self.top_k, min_p=self.min_p, presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty, repetition_penalty=self.repetition_penalty,
             logit_bias={int(key): value for key, value in self.logit_bias.items()}, tools=tuple(tools),
-            tool_choice=self.choice(), parallel_tool_calls=self.parallel_tool_calls, **extra)
+            tool_choice=self.choice(), parallel_tool_calls=self.parallel_tool_calls,
+            chat_template_kwargs=self.chat_template_kwargs,
+            reasoning_effort_explicit=("effort" in self.reasoning.model_fields_set if isinstance(self, ResponsesRequest)
+                                       else "reasoning_effort" in self.model_fields_set), **extra)
 
 
 class ChatCompletionRequest(GenerationRequest):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import math
 import json
@@ -12,6 +12,9 @@ from typing import Iterator, Protocol
 
 from .prompt import Tokenizer
 from .prompt_cache import CacheUsage, tracked_tokens
+from .output_parsers import (
+    REASONING_MARKERS, TOOL_STARTS, detect_tool_parser, parser_name, template_text,
+)
 
 
 @dataclass(frozen=True)
@@ -34,8 +37,16 @@ class GenerationOptions:
     parallel_tool_calls: bool = True
     reasoning_effort: str = "none"
     response_format: dict = field(default_factory=lambda: {"type": "text"})
+    tool_call_parser: str = "auto"
+    reasoning_parser: str = "auto"
+    chat_template_kwargs: dict = field(default_factory=dict)
+    chat_template: str | None = None
+    reasoning_effort_explicit: bool = False
 
     def __post_init__(self):
+        parser_name(self.tool_call_parser)
+        parser_name(self.reasoning_parser, reasoning=True)
+        validate_template_kwargs(self.chat_template_kwargs)
         if type(self.max_new_tokens) is not int or not 1 <= self.max_new_tokens <= 32768:
             raise ValueError("max output tokens must be between 1 and 32768")
         if not math.isfinite(self.temperature) or not 0 <= self.temperature <= 2:
@@ -75,6 +86,45 @@ class PreparedGeneration:
     input_ids: list[int]
     options: GenerationOptions
     reasoning_prefix: str = ""
+
+
+def validate_template_kwargs(values):
+    if not isinstance(values, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    reserved = {"messages", "tools", "functions", "tokenize", "add_generation_prompt", "chat_template",
+                "return_dict", "return_tensors"}
+    if reserved.intersection(values):
+        raise ValueError("chat_template_kwargs cannot override messages, tools or template rendering")
+    if any(not isinstance(key, str) for key in values):
+        raise ValueError("chat_template_kwargs keys must be strings")
+    for key in ("enable_thinking", "thinking"):
+        if key in values and type(values[key]) is not bool:
+            raise ValueError(f"chat_template_kwargs.{key} must be a boolean")
+    if "reasoning_effort" in values and not isinstance(values["reasoning_effort"], str):
+        raise ValueError("chat_template_kwargs.reasoning_effort must be a string")
+    if "enable_thinking" in values and "thinking" in values and values["enable_thinking"] != values["thinking"]:
+        raise ValueError("chat_template_kwargs contains conflicting thinking controls")
+    json.dumps(values, allow_nan=False)
+
+
+def template_options(effort, defaults, overrides, explicit):
+    def apply(target, values):
+        if "reasoning_effort" in values:
+            enabled = values["reasoning_effort"] not in {"none", "minimal", "off"}
+            target.update(enable_thinking=enabled, thinking=enabled)
+        target.update(values)
+        if "enable_thinking" in values:
+            target["thinking"] = values["enable_thinking"]
+        elif "thinking" in values:
+            target["enable_thinking"] = values["thinking"]
+    enabled = effort not in {"none", "minimal"}
+    requested = {"reasoning_effort": effort, "enable_thinking": enabled, "thinking": enabled}
+    kwargs = requested.copy()
+    apply(kwargs, defaults)
+    if explicit:
+        kwargs.update(requested)
+    apply(kwargs, overrides)
+    return kwargs
 
 
 class GenerationBackend(Protocol):
@@ -123,7 +173,8 @@ def reasoning_token_count(tokens, tokenizer, prefix):
     count = 0
     # Marker token sequences are stable special-token boundaries in Qwen and
     # Gemma. Do not re-tokenize the reasoning prose to estimate usage.
-    for opening, closing in (("<think>", "</think>"), ("<|channel>thought\n", "<channel|>")):
+    boundaries = [tokenizer.encode(marker, add_special_tokens=False) for marker in TOOL_STARTS]
+    for _, opening, closing in REASONING_MARKERS:
         start_marker = tokenizer.encode(opening, add_special_tokens=False)
         end_marker = tokenizer.encode(closing, add_special_tokens=False)
         if not start_marker or not end_marker:
@@ -138,6 +189,12 @@ def reasoning_token_count(tokens, tokenizer, prefix):
                 active = False
                 index += len(end_marker)
             else:
+                boundary = next((marker for marker in boundaries if marker and
+                                 tokens[index:index + len(marker)] == marker), None) if active else None
+                if boundary:
+                    active = False
+                    index += len(boundary)
+                    continue
                 count += int(active)
                 index += 1
     return count
@@ -197,9 +254,16 @@ def sample_tokens(forward, model, input_ids, options, cancel):
 
 
 class GenerationEngine:
-    def __init__(self, backend: GenerationBackend, *, max_input_tokens: int = 4096):
+    def __init__(self, backend: GenerationBackend, *, max_input_tokens: int = 4096,
+                 tool_call_parser="auto", reasoning_parser="auto", chat_template_kwargs=None,
+                 chat_template=None):
         self.backend = backend
         self.max_input_tokens = max_input_tokens
+        self.tool_call_parser = parser_name(tool_call_parser)
+        self.reasoning_parser = parser_name(reasoning_parser, reasoning=True)
+        self.chat_template_kwargs = chat_template_kwargs or {}
+        validate_template_kwargs(self.chat_template_kwargs)
+        self.chat_template = chat_template
 
     def prepare(self, messages: list[dict], options: GenerationOptions) -> PreparedGeneration:
         if not callable(getattr(self.backend, "generate_tokens", None)):
@@ -214,11 +278,36 @@ class GenerationEngine:
             if not isinstance(content, str) or (not content and not message.get("tool_calls") and role != "tool"):
                 raise ValueError("message content must be nonempty text")
             normalized.append({**message, "role": "system" if role == "developer" else role, "content": content})
+        while len(normalized) > 1 and normalized[0]["role"] == normalized[1]["role"] == "system":
+            normalized[0]["content"] += "\n\n" + normalized.pop(1)["content"]
         from .completion import prompt_messages
+        template = self.chat_template or options.chat_template or template_text(self.backend.tokenizer)
+        tool_parser = self.tool_call_parser if options.tool_call_parser == "auto" else parser_name(options.tool_call_parser)
+        if tool_parser == "auto":
+            tool_parser = detect_tool_parser(template)
+        reasoning_parser = self.reasoning_parser if options.reasoning_parser == "auto" else parser_name(options.reasoning_parser, reasoning=True)
+        kwargs = template_options(options.reasoning_effort, self.chat_template_kwargs,
+                                  options.chat_template_kwargs,
+                                  options.reasoning_effort_explicit or options.reasoning_effort != "none")
+        thinking = kwargs["enable_thinking"]
+        if reasoning_parser == "auto" and (thinking or (options.tools and options.tool_choice != "none")):
+            for family, opening, _ in REASONING_MARKERS:
+                if opening in template or (family == "gemma4" and "<|channel>thought" in template):
+                    reasoning_parser = family
+                    break
+        effort = kwargs["reasoning_effort"] if thinking else "none"
+        if thinking and effort in {"none", "minimal", "off"}:
+            effort = "low"
+        options = replace(options, tool_call_parser=tool_parser, reasoning_parser=reasoning_parser,
+                          chat_template=self.chat_template or options.chat_template,
+                          reasoning_effort=effort)
         normalized = prompt_messages(normalized, options, self.backend.tokenizer)
-        kwargs = {"enable_thinking": options.reasoning_effort not in {"none", "minimal"}}
         if options.tools and options.tool_choice != "none":
+            if tool_parser == "none":
+                raise ValueError("tool parsing is disabled for this model")
             kwargs["tools"] = list(options.tools)
+        if options.chat_template:
+            kwargs["chat_template"] = options.chat_template
         prompt = self.backend.tokenizer.apply_chat_template(
             normalized, tokenize=False, add_generation_prompt=True, **kwargs,
         )
@@ -239,7 +328,7 @@ class GenerationEngine:
             context = getattr(model.config.get_text_config(), "max_position_embeddings", None)
         if context is not None and len(ids) + options.max_new_tokens > context:
             raise ValueError(f"prompt plus max output tokens exceeds model context limit {context}")
-        prefix = "<think>" if prompt.rstrip().endswith("<think>") else ""
+        prefix = next((opening for _, opening, _ in REASONING_MARKERS if prompt.rstrip().endswith(opening.rstrip())), "")
         return PreparedGeneration(ids, options, prefix)
 
     def stream(self, prepared: PreparedGeneration, cancel: Event) -> Iterator[str | GenerationResult]:

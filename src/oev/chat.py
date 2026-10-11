@@ -89,6 +89,7 @@ def completion(result, options):
 
 def buffered(options):
     return bool((options.tools and options.tool_choice != "none") or options.reasoning_effort != "none"
+                or options.reasoning_parser not in {"auto", "none"}
                 or options.response_format["type"] != "text" or options.logprobs)
 
 
@@ -124,11 +125,11 @@ def output_message(item_id, text="", status="completed", logprobs=()):
     }
 
 
-def response_body(body, response_id, created, item_id, result=None):
+def response_body(body, response_id, created, item_id, result=None, options=None):
     status = "in_progress" if result is None else "incomplete" if result.finish_reason == "length" else "completed"
     output = []
     if result is not None:
-        value = completion(result, body.options())
+        value = completion(result, options or body.options())
         if value.reasoning:
             output.append({"id": "rs_" + uuid4().hex, "type": "reasoning", "status": status,
                            "summary": [{"type": "summary_text", "text": value.reasoning}] if body.reasoning.summary else [],
@@ -304,7 +305,7 @@ async def responses_stream(service, prepared, body, request, response_id, create
                     yield event("response.output_text.delta", **positions, delta=value, logprobs=[])
                 continue
             try:
-                final = response_body(body, response_id, created, item_id, value)
+                final = response_body(body, response_id, created, item_id, value, prepared.options)
                 if body.store:
                     persist(store, final, history)
             except APIError as exc:
@@ -333,6 +334,9 @@ async def responses_stream(service, prepared, body, request, response_id, create
                     yield event("response.output_text.done", **positions, text=part["text"], logprobs=part["logprobs"])
                     yield event("response.content_part.done", **positions, part=part)
                 else:
+                    for content_index, part in enumerate(item["content"]):
+                        yield event("response.reasoning_text.delta", **positions, content_index=content_index, delta=part["text"])
+                        yield event("response.reasoning_text.done", **positions, content_index=content_index, text=part["text"])
                     for summary_index, part in enumerate(item["summary"]):
                         yield event("response.reasoning_summary_part.added", **positions, summary_index=summary_index, part={**part, "text": ""})
                         yield event("response.reasoning_summary_text.delta", **positions, summary_index=summary_index, delta=part["text"])
@@ -390,6 +394,7 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
         service = resolve(body.model)
         options = body.options()
         prepared = prepare(service, body.model, [item.message() for item in body.messages], options)
+        options = prepared.options
         completion_id, created = f"chatcmpl-{uuid4().hex}", int(time.time())
         if body.stream:
             return StreamingResponse(
@@ -428,7 +433,7 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
                 responses_stream(service, prepared, body, request, response_id, created, item_id, store, history),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        final = response_body(body, response_id, created, item_id, generate(service, prepared))
+        final = response_body(body, response_id, created, item_id, generate(service, prepared), prepared.options)
         if body.store:
             persist(store, final, history)
         return final

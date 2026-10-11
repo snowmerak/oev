@@ -153,6 +153,9 @@ class ModelConfig(BaseModel):
     context_length: int = Field(default=8192, ge=1, strict=True)
     gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
     chat_template: str | None = None
+    tool_call_parser: str = "auto"
+    reasoning_parser: str = "auto"
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     flash_attn: bool = Field(default=False, strict=True)
     prompt_cache_max_size: int = Field(default=0, ge=0, strict=True,
                                        validation_alias=AliasChoices("prompt_cache_max_size", "prompt_cache_max_bytes"))
@@ -160,6 +163,20 @@ class ModelConfig(BaseModel):
     embedding_query_prefix: str | None = None
     embedding_document_prefix: str | None = None
     gguf_server_path: str | None = None
+
+    @field_validator("tool_call_parser", "reasoning_parser")
+    @classmethod
+    def output_parser(cls, value, info):
+        from .output_parsers import parser_name
+        parser_name(value, reasoning=info.field_name == "reasoning_parser")
+        return value
+
+    @field_validator("chat_template_kwargs")
+    @classmethod
+    def template_kwargs(cls, value):
+        from .generation import validate_template_kwargs
+        validate_template_kwargs(value)
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -199,6 +216,9 @@ def model_configs(args, parser) -> list[ModelConfig]:
         "backend": args.backend, "local_files_only": args.local_files_only,
         "context_length": args.context_length, "gpu_layers": args.gpu_layers, "chat_template": args.chat_template,
         "flash_attn": args.flash_attn,
+        "tool_call_parser": getattr(args, "tool_call_parser", "auto"),
+        "reasoning_parser": getattr(args, "reasoning_parser", "auto"),
+        "chat_template_kwargs": getattr(args, "chat_template_kwargs", {}),
     }
     if args.models_config:
         if args.model or args.served_model:
@@ -240,6 +260,9 @@ def model_configs(args, parser) -> list[ModelConfig]:
             parser.error(f"model {config.name!r}: gguf_server_path requires a GGUF embedding model")
         if config.task == "embedding" and config.chat_template is not None:
             parser.error(f"model {config.name!r}: embedding models do not use chat_template")
+        if config.task == "embedding" and (config.tool_call_parser != "auto" or config.reasoning_parser != "auto"
+                                            or config.chat_template_kwargs):
+            parser.error(f"model {config.name!r}: output parsers and template kwargs require generation")
         if config.task == "generation" and (config.pooling != "auto" or config.embedding_query_prefix is not None
                                             or config.embedding_document_prefix is not None):
             parser.error(f"model {config.name!r}: pooling and embedding prefixes require task=embedding")
@@ -258,8 +281,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
                 parser.error(f"model {config.name!r}: device=cpu requires gpu_layers=0")
             if config.device in {"cuda", "mps"} and config.gpu_layers == 0:
                 parser.error(f"model {config.name!r}: a GPU device requires nonzero gpu_layers")
-        elif config.gpu_layers is not None or config.chat_template is not None or config.context_length != 8192:
-            parser.error(f"model {config.name!r}: context_length, gpu_layers, and chat_template are GGUF-only")
+        elif config.gpu_layers is not None or config.context_length != 8192:
+            parser.error(f"model {config.name!r}: context_length and gpu_layers are GGUF-only")
         if backend == "mlx" and (config.device not in {"auto", "cpu", "mps"} or config.dtype != "auto"):
             parser.error(f"model {config.name!r}: MLX requires device=auto/cpu/mps and dtype=auto")
         if config.device == "hybrid-cuda" and config.dtype not in {"auto", "bfloat16"}:
@@ -277,15 +300,21 @@ def _load_service(config: ModelConfig):
             pooling=config.pooling, query_prefix=config.embedding_query_prefix,
             document_prefix=config.embedding_document_prefix, gguf_server_path=config.gguf_server_path,
         )
+    gguf = model_backend(config.model, config.backend) == "gguf"
+    template = Path(config.chat_template).expanduser().read_text(encoding="utf-8") if config.chat_template and not gguf else None
     engine = DecisionEngine.from_pretrained(
         config.model, revision=config.revision, device=config.device, dtype=config.dtype,
         max_input_tokens=config.max_input_tokens,
         backend=config.backend, local_files_only=config.local_files_only,
-        context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
+        context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template if gguf else None,
         flash_attn=config.flash_attn,
         prompt_cache_max_size=config.prompt_cache_max_size,
     )
-    return SystemOneService(engine, config.name, max_concurrency=config.max_concurrency)
+    return SystemOneService(
+        engine, config.name, max_concurrency=config.max_concurrency,
+        tool_call_parser=config.tool_call_parser, reasoning_parser=config.reasoning_parser,
+        chat_template_kwargs=config.chat_template_kwargs, chat_template=template,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -293,6 +322,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model", action="append", help="Hugging Face model ID or local path; repeat to load multiple models")
     parser.add_argument("--served-model", action="append", help="API model name; repeat once per --model, in the same order")
     parser.add_argument("--models-config", help="JSON array with per-model loading options")
+    parser.add_argument("--tool-call-parser", default="auto", help="Model output protocol; auto recognizes native tool delimiters")
+    parser.add_argument("--reasoning-parser", default="auto", help="Model reasoning protocol, e.g. qwen3, gemma4, deepseek-r1")
+    parser.add_argument("--chat-template-kwargs", type=json.loads, default={},
+                        help="JSON object of model-specific template options; per-model JSON config can override it")
     parser.add_argument("--task", choices=["generation", "embedding"], default="generation",
                         help="Default model task; JSON entries can override it")
     parser.add_argument("--revision", help="Hugging Face commit revision")
@@ -300,7 +333,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--local-files-only", action="store_true", help="HF/MLX: use downloaded files/cache without network access")
     parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size, including generated tokens")
     parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all; auto/cpu defaults to 0")
-    parser.add_argument("--chat-template", help="GGUF: override embedded chat template with a Jinja file")
+    parser.add_argument("--chat-template", help="Override generation chat template with a Jinja file (HF/GGUF/MLX)")
     parser.add_argument("--flash-attn", action=argparse.BooleanOptionalAction, default=False,
                         help="GGUF: request native Flash Attention (default: disabled)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")

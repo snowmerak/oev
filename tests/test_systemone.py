@@ -150,7 +150,12 @@ def test_http_contract_and_validation_before_inference():
     assert "not a calibrated" in skill.text
     assert client.get("/v1/models").json() == {
         "object": "list",
-        "data": [{"id": "oev-test", "object": "model", "created": 0, "owned_by": "oev"}],
+        "data": [{
+            "id": "oev-test", "object": "model", "created": 0, "owned_by": "oev",
+            "task": "generation", "max_input_tokens": 100_000,
+            "context_length": 100_000, "max_output_tokens": 32768,
+            "tool_call_parser": "auto",
+        }],
         "models": [
             {
                 "name": "oev-test",
