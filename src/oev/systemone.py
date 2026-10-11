@@ -10,7 +10,8 @@ from typing import Any, Iterator, Mapping
 
 from .engine import DecisionEngine
 from .generation import GenerationEngine, GenerationOptions, GenerationResult, PreparedGeneration, template_options
-from .output_parsers import REASONING_MARKERS, detect_tool_parser, parser_name, template_text
+from .output_parsers import detect_tool_parser, parser_name, template_text
+from .reasoning import reasoning_metadata
 from .types import Decision, MAX_OPTIONS, Option
 
 
@@ -205,21 +206,10 @@ class SystemOneService:
         profile = parser_name(self._generation_options["tool_call_parser"])
         metadata["tool_call_parser"] = detect_tool_parser(template) if profile == "auto" else profile
         reasoning = parser_name(self._generation_options["reasoning_parser"], reasoning=True)
-        known = reasoning not in {"auto", "none"} or (reasoning == "auto" and any(
-            opening.rstrip() in template for _, opening, _ in REASONING_MARKERS
-        ))
-        if known:
-            defaults = template_options("none", self._generation_options["chat_template_kwargs"] or {}, {}, False)
-            effort = defaults["reasoning_effort"] if defaults["enable_thinking"] else "none"
-            if defaults["enable_thinking"] and effort in {"none", "minimal", "off"}:
-                effort = "low"
-            metadata["capabilities"] = {"reasoning": {
-                "supported": True, "control": "effort",
-                "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                "default_effort": effort,
-            }}
-        elif reasoning == "none":
-            metadata["capabilities"] = {"reasoning": {"supported": False}}
+        defaults = template_options("none", self._generation_options["chat_template_kwargs"] or {}, {}, False)
+        capability = reasoning_metadata(template, reasoning, defaults)
+        if capability is not None:
+            metadata["capabilities"] = {"reasoning": capability}
         return metadata
 
     def evaluate(self, request: Mapping[str, Any]) -> dict[str, Any]:

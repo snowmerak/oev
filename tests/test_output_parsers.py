@@ -396,9 +396,9 @@ def test_model_catalog_advertises_effective_context_and_reasoning_controls():
     assert model["context_length"] == 32768 and model["context_window"] == 131072
     assert model["max_input_tokens"] == model["max_output_tokens"] == 32768
     assert model["tool_call_parser"] == "qwen3_xml"
-    assert model["capabilities"]["reasoning"]["supported_efforts"] == [
-        "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    ]
+    assert model["capabilities"]["reasoning"]["supported"] is True
+    assert "supported_efforts" not in model["capabilities"]["reasoning"]
+    assert model["capabilities"]["reasoning"].get("control") != "effort"
 
 
 def test_hf_template_override_and_parser_configuration_load_through_cli(monkeypatch, tmp_path):

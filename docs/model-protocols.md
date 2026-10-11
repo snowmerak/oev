@@ -129,6 +129,16 @@ system/developer instructions are merged for templates requiring one system turn
 
 `GET /v1/models` advertises `max_input_tokens`, `max_output_tokens`,
 the selected tool protocol, task, and discoverable reasoning controls.
+Reasoning output parsing does not establish effort support. Templates using only
+thinking flags advertise `control="toggle"` and `default_enabled`, without an
+effort list. Templates with no discoverable control advertise `fixed`; unknown
+effort ranges omit control/levels. Closed literal comparisons and canonical
+level assignments in the native Jinja template determine `supported_efforts`.
+Comments, history fields and unrelated enums are excluded. For Sharp's
+Qwen3.8 template the distinct controls are `none`, `low`, `medium`, `xhigh`;
+`minimal`, `high`, and `max` are aliases, not additional native levels.
+The API still accepts its existing effort enum for compatibility; acceptance
+and template toggling do not imply support for distinct native effort levels.
 `context_length` is the conservative minimum of the native context window
 and the server input limit, so q's budget stays within the accepted input size.
 `context_window` preserves the actual configured/native window. A request's
