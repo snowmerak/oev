@@ -165,6 +165,19 @@ def test_auto_detection_loads_mlx_weights_once_with_metal_and_eager_evaluation(r
     assert runtime.mx.current.stream is None
 
 
+def test_mlx_extended_sampling_keeps_request_state_and_stream_affinity(runtime):
+    backend = DecisionEngine.from_pretrained(str(runtime.path), backend="mlx").backend
+    options = GenerationOptions(4, temperature=.7, seed=42, top_k=2, min_p=.1,
+        presence_penalty=.2, frequency_penalty=.3, repetition_penalty=1.1,
+        logit_bias={ord("Z"): 100}, logprobs=True, top_logprobs=2)
+    for _ in range(2):
+        tokens = list(backend.generate_tokens([1, 2], options, Event()))
+        assert tokens == [ord("Z")] * 4
+        assert all(token.logprob <= 0 and token.top for token in tokens)
+    assert runtime.mx.current.stream is None
+    assert not backend._lock.locked()
+
+
 @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
 @pytest.mark.parametrize("stream", [False, True])
 def test_generation_sse_and_selection_share_mlx_model_with_isolated_caches(runtime, path, stream):

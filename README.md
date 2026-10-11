@@ -428,15 +428,47 @@ The supported request fields are:
 
 | Endpoint | Fields |
 | --- | --- |
-| Both | `model`, `temperature` (0–2; default 0 for greedy decoding), `top_p` (greater than 0 and at most 1), `stream`, `store` (false only) |
-| Chat Completions | `messages`, `max_completion_tokens` or `max_tokens`, `stop` (up to four strings), `n` (1 only), `stream_options.include_usage`, `response_format` (text only) |
-| Responses | `input` (string or message array), `instructions`, `max_output_tokens`, `text.format` (text only) |
+| Both | `model`, `temperature` (0–2; default 0), `top_p` (0–1, excluding 0), `stream`, `store`, `tools`, `tool_choice`, `parallel_tool_calls`, `seed`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `metadata` |
+| Chat Completions | `messages`, `max_completion_tokens` or `max_tokens`, `stop` (up to four strings), `n` (1–8), `stream_options.include_usage`, `response_format`, `reasoning_effort`, `logprobs`, `top_logprobs`, text-only `modalities` |
+| Responses | `input` (string or item array), `instructions`, `max_output_tokens`, `text.format`, `text.verbosity`, `reasoning.effort`, `reasoning.summary`, `previous_response_id`, `include=["message.output_text.logprobs"]`, `top_logprobs` |
+| Identifiers and local policy | `user`, `safety_identifier`, `conversation_id`, `cache_affinity_id`, `prompt_cache_key`, `prompt_cache_retention="in-memory"`, `service_tier="auto"` or `"default"` |
 
-Messages support `system`, `developer`, `user`, and `assistant` roles. Developer messages are passed to model templates as system messages. Content can be a string or text parts (`text` for Chat Completions; `input_text`/`output_text` for Responses). For another turn, resend the history; Responses output message items can be appended to the next `input` array.
+Messages support `system`, `developer`, `user`, `assistant`, and `tool` roles. Developer messages are passed to model templates as system messages. Content can be a string or text parts (`text` for Chat Completions; `input_text`/`output_text` for Responses). An assistant invoking a function may have `content=null` with `tool_calls`; the following tool messages must provide matching `tool_call_id` values. All pending calls require results before generation continues. Responses accepts message items, `function_call`, `function_call_output`, and native reasoning items, including replay of its own output. Message `phase` values from q are accepted.
 
-Output limits default to 256 and accept 1–4,096 tokens. Prompts obey `--max-input-tokens`, and prompt plus requested output must fit the model context. Input is never truncated. Token usage includes generated stop/EOS tokens, even when they are omitted from displayed text. A length-limited completion reports `finish_reason="length"`; Responses reports `status="incomplete"` with `incomplete_details.reason="max_output_tokens"`.
+Output limits default to 256 and accept 1–32,768 tokens. Prompts obey `--max-input-tokens`, and prompt plus requested output must fit the model context. Input is never truncated (`truncation="disabled"`). Token usage includes generated stop/EOS tokens, even when they are omitted from displayed text. A length-limited completion reports `finish_reason="length"`; Responses reports `status="incomplete"` with `incomplete_details.reason="max_output_tokens"`. Multiple Chat choices run sequentially; output usage is summed and prompt usage is reported once. An unsigned 64-bit `seed` uses a request-local sampler, with `seed + choice_index` for multiple choices. Reproducibility applies within the same model/runtime/configuration; floating-point kernels and quantization can differ across backends.
 
-These endpoints are stateless: response storage, `previous_response_id`, tool calls, multimodal input/output, log probabilities, and JSON/schema output constraints are unsupported. Unsupported fields and invalid generation inputs return HTTP `400` with an OpenAI-style error object; an unknown model returns `404`. System One keeps its existing `422` validation behavior. Generation failures return `500`, or a streaming error event after SSE starts. Client disconnection cancels a stream between model forwards; its execution slot remains occupied until the worker exits.
+Function tools use each checkpoint's chat template, with a portable XML/JSON instruction when the template has no tool declarations. Parsers support Qwen/Hermes XML calls, Gemma calls, Llama JSON calls, Mistral `[TOOL_CALLS]`, and complete JSON function envelopes. Chat tools use `{ "type": "function", "function": { "name": ..., "parameters": ... } }`; Responses tools put `name`, `description`, `parameters`, and `strict` directly beside `type`. Choices may be `auto`, `none`, `required`, or a named function. Named/required choices and `parallel_tool_calls=false` are checked against the generated result. `strict=true` validates function arguments against their schema. Unknown functions, malformed arguments, missing required calls, and schema mismatches return `502 invalid_model_output`, so a client never receives an invalid executable call. The caller executes functions and sends their results; oev does not execute them.
+
+```python
+response = client.responses.create(
+    model=model,
+    input="What is the weather in Seoul?",
+    tools=[{"type": "function", "name": "weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}},
+        "required": ["city"], "additionalProperties": False,
+    }, "strict": True}],
+    tool_choice="required",
+    max_output_tokens=512,
+)
+call = next(item for item in response.output if item.type == "function_call")
+# Execute weather using call.arguments in your application, then send the result.
+reply = client.responses.create(
+    model=model,
+    input=[{"role": "user", "content": "What is the weather in Seoul?"},
+           *[item.model_dump() for item in response.output],
+           {"type": "function_call_output", "call_id": call.call_id,
+            "output": "Sunny, 20 degrees Celsius"}],
+)
+print(reply.output_text)
+```
+
+`response_format` (Chat) and `text.format` (Responses) support `text`, `json_object`, and `json_schema`. Chat schemas use `{"type":"json_schema","json_schema":{"name":"result","schema":{...},"strict":true}}`; Responses uses `{"type":"json_schema","name":"result","schema":{...},"strict":true}`. JSON output uses prompt instructions and post-generation validation, **not grammar-constrained decoding**. A completed invalid output returns `502 invalid_model_output`; a length-limited response can contain partial JSON and remains incomplete. Only local JSON Schema references are allowed. Model compliance determines whether a required tool call or valid JSON can be produced.
+
+Reasoning effort accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. `none`/`minimal` disable template thinking; the other levels enable it. These levels are a template toggle rather than calibrated compute budgets. Qwen `<think>` and Gemma thought channels are separated from the final answer: Chat exposes `reasoning_content`, and Responses exposes reasoning items. Requested reasoning summaries expose the model's visible thought text; oev does not generate a separate summary. `text.verbosity` adds a style instruction. Plain text streams incrementally. Tool, reasoning, JSON, and logprob streams buffer until generation completes, then send parsed SSE deltas/items; tool arguments and JSON are validated before emission. Sampling extensions/logprobs on HF and MLX copy final-position logits to a CPU sampler; the default path retains native sampling. Probabilities describe the distribution after penalties, temperature and filtering. Visible text token records exclude EOS and protocol-only content; tokens spanning a protocol boundary may be omitted.
+
+Storage is opt-in (`store=false` by default). `store=true` retains completed Chat/Responses results in a shared process-local LRU with limits of **256 entries, 64 MiB, and one hour**. Storage is cleared on restart; expiry/eviction yields `404`. `GET` and `DELETE /v1/responses/{id}` and `/v1/chat/completions/{id}` retrieve/delete stored results. `GET /v1/responses/{id}/input_items` supports `limit`, `order`, `after`, and `before`. `previous_response_id` joins the stored input and output with the new input, and must reference the same model. Previous instructions are not inherited; supply instructions for the new request. Without storage, resend history. Storage is separate from the model's KV prompt cache. Identifier fields do not create conversation history or change exact-token cache matching; configure `prompt_cache_max_size` to retain KV snapshots. Local service tiers all use the default scheduler.
+
+Multimodal input/output, hosted web/file/computer tools, background execution, encrypted reasoning replay, automatic truncation, and deprecated `functions`/`function_call` contracts are unsupported. Unknown or invalid request fields return HTTP `400` with an OpenAI-style error object identifying the parameter; an unknown model returns `404`. System One keeps its existing `422` validation behavior. Generation failures return `500`, or a streaming error event after SSE starts. Client disconnection cancels a stream between model forwards; its execution slot remains occupied until the worker exits.
 
 The Python API can generate using an existing decision backend too:
 

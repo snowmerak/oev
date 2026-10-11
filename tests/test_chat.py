@@ -163,12 +163,12 @@ def test_responses_stream_lifecycle_and_final_text(limit, terminal, status):
 
 
 @pytest.mark.parametrize("fields", [
-    {"tools": [{"type": "function"}]}, {"n": 2}, {"temperature": 3},
+    {"tools": [{"type": "function"}]}, {"n": 9}, {"temperature": 3},
     {"messages": []}, {"messages": [{"role": "user", "content": ""}]},
     {"max_tokens": 0}, {"max_tokens": 3, "max_completion_tokens": 4},
     {"stop": ""}, {"stop": ["1", "2", "3", "4", "5"]},
-    {"stream_options": {"include_usage": True}}, {"store": True},
-    {"response_format": {"type": "json_object"}},
+    {"stream_options": {"include_usage": True}}, {"store": "invalid"},
+    {"response_format": {"type": "json_schema"}},
     {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
 ])
 def test_unsupported_or_invalid_requests_fail_before_generation(fields):
@@ -188,7 +188,7 @@ def test_unknown_model_and_context_limits_and_stateless_responses():
     assert "truncation is disabled" in response.json()["error"]["message"]
     assert client.post("/v1/responses", json={
         "model": "one-model", "input": "Hello", "previous_response_id": "resp_x",
-    }).status_code == 400
+    }).status_code == 404
     assert not backend.calls
 
 

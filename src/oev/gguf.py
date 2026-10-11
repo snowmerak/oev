@@ -23,7 +23,9 @@ class GGUFTokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         # The embedded Jinja template owns BOS and assistant-prefix insertion.
-        return self.formatter(messages=messages, enable_thinking=False).prompt
+        values = {key: value for key, value in kwargs.items() if key not in {"tokenize", "add_generation_prompt"}}
+        values.setdefault("enable_thinking", False)
+        return self.formatter(messages=messages, **values).prompt
 
     def encode(self, text, add_special_tokens=False):
         return self.llama.tokenize(text.encode("utf-8"), add_bos=add_special_tokens, special=True)
@@ -170,6 +172,7 @@ class GGUFBackend:
 
     def generate_tokens(self, input_ids, options, cancel):
         import numpy as np
+        from .sampling import sample_logits
 
         self._validate_context(input_ids, options.max_new_tokens)
         while not cancel.is_set():
@@ -180,7 +183,8 @@ class GGUFBackend:
         try:
             if not self._prefill(input_ids, cancel):
                 return
-            rng = np.random.default_rng()
+            rng = np.random.default_rng(options.seed)
+            generated = []
             for index in range(options.max_new_tokens):
                 if cancel.is_set():
                     return
@@ -190,21 +194,8 @@ class GGUFBackend:
                 logits = np.ctypeslib.as_array(pointer, shape=(self.llama.n_vocab(),)).astype(np.float64)
                 if not np.isfinite(logits).all():
                     raise RuntimeError("model returned nonfinite generation logits")
-                if options.temperature == 0:
-                    token = int(logits.argmax())
-                else:
-                    # Match the HF temperature/top-p policy, without implicit penalties.
-                    logits = (logits - logits.max()) / options.temperature
-                    probabilities = np.exp(logits)
-                    probabilities /= probabilities.sum()
-                    if options.top_p < 1:
-                        order = np.argsort(-probabilities)
-                        remove = probabilities[order].cumsum() > options.top_p
-                        remove[1:] = remove[:-1].copy()
-                        remove[0] = False
-                        probabilities[order[remove]] = 0
-                        probabilities /= probabilities.sum()
-                    token = int(rng.choice(len(probabilities), p=probabilities))
+                token = sample_logits(logits, options, generated, rng, input_ids)
+                generated.append(int(token))
                 yield token
                 if self.is_end_token(token) or cancel.is_set():
                     return

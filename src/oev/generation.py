@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 import math
+import json
+import re
 from threading import Event
 from typing import Iterator, Protocol
 
@@ -17,16 +20,42 @@ class GenerationOptions:
     temperature: float = 0.0
     top_p: float = 1.0
     stop: tuple[str, ...] = ()
+    seed: int | None = None
+    top_k: int = 0
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    logit_bias: dict[int, float] = field(default_factory=dict)
+    logprobs: bool = False
+    top_logprobs: int = 0
+    tools: tuple[dict, ...] = ()
+    tool_choice: str = "auto"
+    parallel_tool_calls: bool = True
+    reasoning_effort: str = "none"
+    response_format: dict = field(default_factory=lambda: {"type": "text"})
 
     def __post_init__(self):
-        if type(self.max_new_tokens) is not int or not 1 <= self.max_new_tokens <= 4096:
-            raise ValueError("max output tokens must be between 1 and 4096")
+        if type(self.max_new_tokens) is not int or not 1 <= self.max_new_tokens <= 32768:
+            raise ValueError("max output tokens must be between 1 and 32768")
         if not math.isfinite(self.temperature) or not 0 <= self.temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
         if not math.isfinite(self.top_p) or not 0 < self.top_p <= 1:
             raise ValueError("top_p must be greater than 0 and at most 1")
         if len(self.stop) > 4 or any(not isinstance(item, str) or not item for item in self.stop):
             raise ValueError("stop must contain at most four nonempty strings")
+        if self.seed is not None and (type(self.seed) is not int or not 0 <= self.seed < 2**64):
+            raise ValueError("seed must be an unsigned 64-bit integer")
+        if type(self.top_k) is not int or self.top_k < 0 or not math.isfinite(self.min_p) or not 0 <= self.min_p <= 1:
+            raise ValueError("invalid top_k or min_p")
+        if any(not math.isfinite(value) or not -2 <= value <= 2 for value in (self.presence_penalty, self.frequency_penalty)):
+            raise ValueError("presence/frequency penalties must be between -2 and 2")
+        if not math.isfinite(self.repetition_penalty) or self.repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+        if any(type(token) is not int or token < 0 or not math.isfinite(bias) or not -100 <= bias <= 100 for token, bias in self.logit_bias.items()):
+            raise ValueError("logit_bias must map nonnegative token IDs to biases between -100 and 100")
+        if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20 or (self.top_logprobs and not self.logprobs):
+            raise ValueError("top_logprobs requires logprobs=true and must be between 0 and 20")
 
 
 @dataclass(frozen=True)
@@ -36,12 +65,16 @@ class GenerationResult:
     output_tokens: int
     finish_reason: str
     cached_input_tokens: int = 0
+    raw_text: str | None = None
+    token_logprobs: tuple[dict, ...] = ()
+    reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True)
 class PreparedGeneration:
     input_ids: list[int]
     options: GenerationOptions
+    reasoning_prefix: str = ""
 
 
 class GenerationBackend(Protocol):
@@ -51,6 +84,63 @@ class GenerationBackend(Protocol):
     def generate_tokens(
         self, input_ids: list[int], options: GenerationOptions, cancel: Event,
     ) -> Iterator[int]: ...
+
+
+@lru_cache(maxsize=1)
+def byte_decoder():
+    alphabet = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    missing = [byte for byte in range(256) if byte not in alphabet]
+    mapping = {chr(byte): byte for byte in alphabet}
+    mapping.update({chr(256 + index): byte for index, byte in enumerate(missing)})
+    return mapping
+
+
+def token_record(tokenizer, token_id, probability):
+    token_id = int(token_id)
+    value = tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    data = value.encode("utf-8")
+    llama = getattr(tokenizer, "llama", None)
+    converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if llama is not None:
+        data = llama.detokenize([token_id], special=True)
+    elif converter is not None:
+        piece = converter(token_id)
+        if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", piece):
+            data = bytes([int(piece[3:5], 16)])
+        else:
+            decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
+            state = json.loads(decoder.__getstate__()) if decoder is not None else {}
+            if state.get("type") == "ByteLevel":
+                # Reverse the GPT byte-to-Unicode alphabet, including partial
+                # UTF-8 tokens whose individual display strings contain U+FFFD.
+                mapping = byte_decoder()
+                if all(char in mapping for char in piece):
+                    data = bytes(mapping[char] for char in piece)
+    return {"token": value, "logprob": probability, "bytes": list(data)}
+
+
+def reasoning_token_count(tokens, tokenizer, prefix):
+    count = 0
+    # Marker token sequences are stable special-token boundaries in Qwen and
+    # Gemma. Do not re-tokenize the reasoning prose to estimate usage.
+    for opening, closing in (("<think>", "</think>"), ("<|channel>thought\n", "<channel|>")):
+        start_marker = tokenizer.encode(opening, add_special_tokens=False)
+        end_marker = tokenizer.encode(closing, add_special_tokens=False)
+        if not start_marker or not end_marker:
+            continue
+        active = prefix == opening
+        index = 0
+        while index < len(tokens):
+            if tokens[index:index + len(start_marker)] == start_marker:
+                active = True
+                index += len(start_marker)
+            elif tokens[index:index + len(end_marker)] == end_marker:
+                active = False
+                index += len(end_marker)
+            else:
+                count += int(active)
+                index += 1
+    return count
 
 
 def eos_token_ids(model) -> set[int]:
@@ -63,6 +153,11 @@ def eos_token_ids(model) -> set[int]:
 def sample_tokens(forward, model, input_ids, options, cancel):
     """Keep the KV cache local; enter inference mode separately for each step."""
     import torch
+    from .sampling import extended_sampling, sample_logits
+    if extended_sampling(options):
+        import numpy as np
+        rng = np.random.default_rng(options.seed)
+    generated = []
 
     cache = None
     current_ids = input_ids
@@ -79,7 +174,9 @@ def sample_tokens(forward, model, input_ids, options, cancel):
             logits = logits.float()
             if not torch.isfinite(logits).all():
                 raise RuntimeError("model returned nonfinite generation logits")
-            if options.temperature == 0:
+            if extended_sampling(options):
+                token = sample_logits(logits.cpu().numpy(), options, generated, rng, input_ids)
+            elif options.temperature == 0:
                 token = logits.argmax().item()
             else:
                 logits = logits / options.temperature
@@ -95,6 +192,7 @@ def sample_tokens(forward, model, input_ids, options, cancel):
         if token in eos:
             return
         history.append(token)
+        generated.append(int(token))
         current_ids = [token] if cache is not None else history
 
 
@@ -103,7 +201,7 @@ class GenerationEngine:
         self.backend = backend
         self.max_input_tokens = max_input_tokens
 
-    def prepare(self, messages: list[dict[str, str]], options: GenerationOptions) -> PreparedGeneration:
+    def prepare(self, messages: list[dict], options: GenerationOptions) -> PreparedGeneration:
         if not callable(getattr(self.backend, "generate_tokens", None)):
             raise NotImplementedError("this backend does not support text generation")
         if not messages:
@@ -111,27 +209,42 @@ class GenerationEngine:
         normalized = []
         for message in messages:
             role, content = message.get("role"), message.get("content")
-            if role not in {"system", "developer", "user", "assistant"}:
-                raise ValueError("messages must use system, developer, user, or assistant roles")
-            if not isinstance(content, str) or not content:
+            if role not in {"system", "developer", "user", "assistant", "tool"}:
+                raise ValueError("invalid message role")
+            if not isinstance(content, str) or (not content and not message.get("tool_calls") and role != "tool"):
                 raise ValueError("message content must be nonempty text")
-            normalized.append({"role": "system" if role == "developer" else role, "content": content})
+            normalized.append({**message, "role": "system" if role == "developer" else role, "content": content})
+        from .completion import prompt_messages
+        normalized = prompt_messages(normalized, options, self.backend.tokenizer)
+        kwargs = {"enable_thinking": options.reasoning_effort not in {"none", "minimal"}}
+        if options.tools and options.tool_choice != "none":
+            kwargs["tools"] = list(options.tools)
         prompt = self.backend.tokenizer.apply_chat_template(
-            normalized, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            normalized, tokenize=False, add_generation_prompt=True, **kwargs,
         )
         ids = self.backend.tokenizer.encode(prompt, add_special_tokens=False)
         if not ids or len(ids) > self.max_input_tokens:
             raise ValueError(f"prompt has {len(ids)} tokens; limit is {self.max_input_tokens}; truncation is disabled")
         model = getattr(self.backend, "model", None)
+        vocabulary = getattr(self.backend.tokenizer, "vocab_size", None)
+        if model is not None:
+            vocabulary = getattr(model.config.get_text_config(), "vocab_size", vocabulary)
+        llama = getattr(self.backend, "llama", None)
+        if llama is not None:
+            vocabulary = llama.n_vocab()
+        if vocabulary is not None and any(token >= vocabulary for token in options.logit_bias):
+            raise ValueError("logit_bias token ID is outside model vocabulary")
         context = getattr(self.backend, "context_window", None)
         if context is None and model is not None:
             context = getattr(model.config.get_text_config(), "max_position_embeddings", None)
         if context is not None and len(ids) + options.max_new_tokens > context:
             raise ValueError(f"prompt plus max output tokens exceeds model context limit {context}")
-        return PreparedGeneration(ids, options)
+        prefix = "<think>" if prompt.rstrip().endswith("<think>") else ""
+        return PreparedGeneration(ids, options, prefix)
 
     def stream(self, prepared: PreparedGeneration, cancel: Event) -> Iterator[str | GenerationResult]:
         tokens: list[int] = []
+        token_logprobs = []
         emitted = ""
         text = ""
         reason = "length"
@@ -147,6 +260,10 @@ class GenerationEngine:
                 if cancel.is_set():
                     return
                 tokens.append(token)
+                end_token = token in eos or (is_end_token is not None and is_end_token(token))
+                if hasattr(token, "logprob") and not end_token:
+                    record = lambda t, p: token_record(self.backend.tokenizer, t, p)
+                    token_logprobs.append({**record(token, token.logprob), "top_logprobs": [record(t, p) for t, p in token.top]})
                 text = self.backend.tokenizer.decode(
                     tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False,
                 )
@@ -155,7 +272,7 @@ class GenerationEngine:
                     text = text[:min(matches)]
                     reason = "stop"
                     break
-                if token in eos or (is_end_token is not None and is_end_token(token)):
+                if end_token:
                     reason = "stop"
                     break
                 # Buffer incomplete words/UTF-8 and possible stop prefixes.
@@ -177,7 +294,16 @@ class GenerationEngine:
             reason = "stop"
         if len(text) > len(emitted):
             yield text[len(emitted):]
-        yield GenerationResult(text, len(prepared.input_ids), len(tokens), reason, usage.cached_tokens)
+        # Gemma's tool-call closing marker is also an EOS token. Keep control
+        # markers for protocol parsing; display text already excludes EOS.
+        raw_text = prepared.reasoning_prefix + self.backend.tokenizer.decode(tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        if stops:
+            matches = [raw_text.find(stop) for stop in stops if stop in raw_text]
+            if matches:
+                raw_text = raw_text[:min(matches)]
+        content_tokens = tokens[:-1] if tokens and (tokens[-1] in eos or (is_end_token and is_end_token(tokens[-1]))) else tokens
+        reasoning_tokens = reasoning_token_count(content_tokens, self.backend.tokenizer, prepared.reasoning_prefix) if prepared.options.reasoning_effort != "none" else 0
+        yield GenerationResult(text, len(prepared.input_ids), len(tokens), reason, usage.cached_tokens, raw_text, tuple(token_logprobs), reasoning_tokens)
 
     def generate(self, prepared: PreparedGeneration) -> GenerationResult:
         for event in self.stream(prepared, Event()):

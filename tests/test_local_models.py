@@ -261,6 +261,19 @@ def test_native_context_lock_spans_stream_and_closing_releases_it(native):
     assert backend.llama.n_tokens == 0
 
 
+def test_gguf_extended_sampling_restores_request_state(native):
+    path, _ = native
+    backend = GGUFBackend.load(str(path))
+    options = GenerationOptions(4, temperature=.7, seed=42, top_k=2, min_p=.1,
+        presence_penalty=.2, frequency_penalty=.3, repetition_penalty=1.1,
+        logit_bias={ord("Z"): 100}, logprobs=True, top_logprobs=2)
+    for _ in range(2):
+        tokens = list(backend.generate_tokens([1, 2], options, Event()))
+        assert tokens == [ord("Z")] * 4
+        assert all(token.logprob <= 0 and token.top for token in tokens)
+        assert backend.llama.n_tokens == 0
+
+
 def test_cancel_while_waiting_for_native_context_does_not_evaluate(native):
     path, _ = native
     backend = GGUFBackend.load(str(path))

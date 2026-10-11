@@ -15,6 +15,21 @@ IDS = [2, 4, 8, 12]
 SLOTS = [5, 7]
 
 
+def test_hf_extended_sampling_with_real_forward_keeps_request_rng_local():
+    model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
+        vocab_size=64, n_positions=128, n_ctx=128, n_embd=32, n_layer=1,
+        n_head=2, eos_token_id=63, pad_token_id=0,
+    )).eval()
+    backend = HuggingFaceBackend(model, tokenizer=None, model_name="tiny-sampled")
+    options = GenerationOptions(4, temperature=.7, seed=42, top_k=2, min_p=.1,
+        presence_penalty=.2, frequency_penalty=.3, repetition_penalty=1.1,
+        logit_bias={7: 100}, logprobs=True, top_logprobs=2)
+    for _ in range(2):
+        tokens = list(backend.generate_tokens(IDS, options, Event()))
+        assert tokens == [7] * 4
+        assert all(token.logprob <= 0 and token.top for token in tokens)
+
+
 def gemma4_model(shared=False):
     text = transformers.Gemma4TextConfig(
         vocab_size=64, vocab_size_per_layer_input=64, hidden_size=32,

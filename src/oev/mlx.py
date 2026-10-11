@@ -134,6 +134,11 @@ class MLXBackend:
                 mx.synchronize(self._stream)
 
     def generate_tokens(self, input_ids, options, cancel):
+        from .sampling import extended_sampling, sample_logits
+        if extended_sampling(options):
+            import numpy as np
+            rng = np.random.default_rng(options.seed)
+        generated = []
         self._validate_context(input_ids, options.max_new_tokens)
         while not cancel.is_set():
             if self._lock.acquire(timeout=0.1):
@@ -157,14 +162,19 @@ class MLXBackend:
                     logits = logits.astype(mx.float32)
                     if not mx.all(mx.isfinite(logits)).item():
                         raise RuntimeError("model returned nonfinite generation logits")
-                    if options.temperature == 0:
+                    if extended_sampling(options):
+                        token = sample_logits(logits.tolist(), options, generated, rng, input_ids)
+                        sampled = mx.array([int(token)], dtype=mx.uint32)
+                    elif options.temperature == 0:
                         sampled = mx.argmax(logits, axis=-1)
                     else:
                         scaled = logits / options.temperature
                         logprobs = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
                         sampled = sampler(logprobs)
                     mx.eval(sampled)
-                    token = int(sampled.item())
+                    if not extended_sampling(options):
+                        token = int(sampled.item())
+                    generated.append(int(token))
                 # Do not retain thread-local stream context across a generator yield.
                 yield token
                 if self.is_end_token(token) or cancel.is_set():

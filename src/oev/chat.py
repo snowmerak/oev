@@ -9,14 +9,16 @@ import logging
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 import time
-from typing import Literal
+from dataclasses import replace
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .api_requests import APIModel, ChatCompletionRequest, ResponsesRequest
+from .completion import parse_completion
+from .response_store import ResponseStore
 
 from .generation import GenerationOptions, GenerationResult
 from .models import ModelCapabilityError, ModelNotFound, ModelRegistry
@@ -24,109 +26,6 @@ from .models import ModelCapabilityError, ModelNotFound, ModelRegistry
 
 logger = logging.getLogger(__name__)
 OPENAI_PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/embeddings"}
-
-
-class APIModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-
-
-class TextPart(APIModel):
-    type: Literal["text"]
-    text: str
-
-
-class ChatMessage(APIModel):
-    role: Literal["system", "developer", "user", "assistant"]
-    content: str | list[TextPart]
-
-    def message(self):
-        text = self.content if isinstance(self.content, str) else "".join(part.text for part in self.content)
-        return {"role": self.role, "content": text}
-
-
-class InputText(APIModel):
-    type: Literal["input_text", "output_text"]
-    text: str
-    annotations: list = Field(default_factory=list, max_length=0)
-    logprobs: list = Field(default_factory=list, max_length=0)
-
-
-class InputMessage(APIModel):
-    type: Literal["message"] = "message"
-    role: Literal["system", "developer", "user", "assistant"]
-    content: str | list[InputText]
-    id: str | None = None
-    status: Literal["completed", "incomplete", "in_progress"] | None = None
-
-    def message(self):
-        text = self.content if isinstance(self.content, str) else "".join(part.text for part in self.content)
-        return {"role": self.role, "content": text}
-
-
-class StreamOptions(APIModel):
-    include_usage: bool = False
-
-
-class TextFormat(APIModel):
-    type: Literal["text"] = "text"
-
-
-class ResponseTextConfig(APIModel):
-    format: TextFormat = Field(default_factory=TextFormat)
-
-
-class GenerationRequest(APIModel):
-    model: str
-    temperature: float = Field(default=0.0, ge=0, le=2)
-    top_p: float = Field(default=1.0, gt=0, le=1)
-    stream: bool = False
-    store: Literal[False] = False
-
-
-class ChatCompletionRequest(GenerationRequest):
-    messages: list[ChatMessage] = Field(min_length=1)
-    max_tokens: int | None = Field(default=None, ge=1, le=4096, strict=True)
-    max_completion_tokens: int | None = Field(default=None, ge=1, le=4096, strict=True)
-    stop: str | list[str] | None = None
-    n: Literal[1] = 1
-    stream_options: StreamOptions | None = None
-    response_format: TextFormat | None = None
-
-    @model_validator(mode="after")
-    def validate_options(self):
-        if self.max_tokens is not None and self.max_completion_tokens is not None:
-            raise ValueError("use only one of max_tokens and max_completion_tokens")
-        if self.stream_options is not None and not self.stream:
-            raise ValueError("stream_options requires stream=true")
-        self.options()
-        return self
-
-    def options(self):
-        stops = (self.stop,) if isinstance(self.stop, str) else tuple(self.stop or ())
-        return GenerationOptions(
-            self.max_completion_tokens or self.max_tokens or 256,
-            self.temperature, self.top_p, stops,
-        )
-
-
-class ResponsesRequest(GenerationRequest):
-    input: str | list[InputMessage]
-    instructions: str | None = None
-    max_output_tokens: int = Field(default=256, ge=1, le=4096, strict=True)
-    text: ResponseTextConfig = Field(default_factory=ResponseTextConfig)
-
-    def messages(self):
-        messages = []
-        if self.instructions:
-            messages.append({"role": "system", "content": self.instructions})
-        messages.extend(
-            [{"role": "user", "content": self.input}] if isinstance(self.input, str)
-            else [item.message() for item in self.input]
-        )
-        return messages
-
-    def options(self):
-        return GenerationOptions(self.max_output_tokens, self.temperature, self.top_p)
 
 
 class APIError(Exception):
@@ -167,6 +66,8 @@ def chat_usage(result):
     }
     if result.cached_input_tokens:
         usage["prompt_tokens_details"] = {"cached_tokens": result.cached_input_tokens}
+    if result.reasoning_tokens:
+        usage["completion_tokens_details"] = {"reasoning_tokens": result.reasoning_tokens}
     return usage
 
 
@@ -175,30 +76,81 @@ def response_usage(result):
         "input_tokens": result.input_tokens, "output_tokens": result.output_tokens,
         "total_tokens": result.input_tokens + result.output_tokens,
         "input_tokens_details": {"cached_tokens": result.cached_input_tokens},
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": result.reasoning_tokens},
     }
 
 
-def output_message(item_id, text="", status="completed"):
+def completion(result, options):
+    try:
+        return parse_completion(result, options)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise APIError(f"Invalid model output: {exc}", status=502, code="invalid_model_output") from exc
+
+
+def buffered(options):
+    return bool((options.tools and options.tool_choice != "none") or options.reasoning_effort != "none"
+                or options.response_format["type"] != "text" or options.logprobs)
+
+
+def chat_message(value):
+    message = {"role": "assistant", "content": value.text or (None if value.calls else ""), "refusal": None}
+    if value.calls:
+        message["tool_calls"] = value.calls
+    if value.reasoning:
+        message["reasoning_content"] = value.reasoning
+    return message
+
+
+def visible_logprobs(result, text):
+    records = result.token_logprobs
+    data = b"".join(bytes(record["bytes"]) for record in records)
+    target = text.encode("utf-8")
+    start = data.rfind(target) if target else -1
+    if start < 0:
+        return []
+    end, offset, visible = start + len(target), 0, []
+    for record in records:
+        stop = offset + len(record["bytes"])
+        if offset >= start and stop <= end:
+            visible.append(record)
+        offset = stop
+    return visible
+
+
+def output_message(item_id, text="", status="completed", logprobs=()):
     return {
         "id": item_id, "type": "message", "role": "assistant", "status": status,
-        "content": [{"type": "output_text", "text": text, "annotations": [], "logprobs": []}],
+        "content": [{"type": "output_text", "text": text, "annotations": [], "logprobs": list(logprobs)}],
     }
 
 
 def response_body(body, response_id, created, item_id, result=None):
     status = "in_progress" if result is None else "incomplete" if result.finish_reason == "length" else "completed"
+    output = []
+    if result is not None:
+        value = completion(result, body.options())
+        if value.reasoning:
+            output.append({"id": "rs_" + uuid4().hex, "type": "reasoning", "status": status,
+                           "summary": [{"type": "summary_text", "text": value.reasoning}] if body.reasoning.summary else [],
+                           "content": [{"type": "reasoning_text", "text": value.reasoning}]})
+        if value.text or not value.calls:
+            output.append(output_message(item_id, value.text, status, visible_logprobs(result, value.text)))
+        for call in value.calls:
+            output.append({"id": "fc_" + uuid4().hex, "type": "function_call", "status": status,
+                           "call_id": call["id"], **call["function"]})
     return {
         "id": response_id, "object": "response", "created_at": created,
         "completed_at": None if result is None else int(time.time()),
         "model": body.model, "status": status, "error": None,
         "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
-        "output": [] if result is None else [output_message(item_id, result.text, status)],
+        "output": output,
         "usage": None if result is None else response_usage(result),
         "instructions": body.instructions, "max_output_tokens": body.max_output_tokens,
-        "temperature": body.temperature, "top_p": body.top_p, "store": False,
-        "tools": [], "tool_choice": "none", "parallel_tool_calls": False,
-        "text": body.text.model_dump(), "metadata": {},
+        "temperature": body.temperature, "top_p": body.top_p, "store": body.store,
+        "tools": body.tools, "tool_choice": body.tool_choice, "parallel_tool_calls": body.parallel_tool_calls,
+        "text": body.text.model_dump(by_alias=True, exclude_none=True), "metadata": body.metadata,
+        "reasoning": body.reasoning.model_dump(), "previous_response_id": body.previous_response_id,
+        "truncation": body.truncation, "service_tier": "default", "background": False,
     }
 
 
@@ -251,68 +203,167 @@ async def generation_events(service, prepared, request):
         cancel.set()
 
 
-async def chat_stream(service, prepared, body, request, completion_id, created):
-    def chunk(delta, reason=None):
+def choice_body(result, options, index=0):
+    value = completion(result, options)
+    return {"index": index, "message": chat_message(value),
+            "finish_reason": "tool_calls" if value.calls and result.finish_reason != "length" else result.finish_reason,
+            "logprobs": {"content": visible_logprobs(result, value.text)} if options.logprobs else None}
+
+
+def aggregate_usage(results):
+    usage = chat_usage(results[0])
+    usage["completion_tokens"] = sum(result.output_tokens for result in results)
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    if any(result.reasoning_tokens for result in results):
+        usage["completion_tokens_details"] = {"reasoning_tokens": sum(result.reasoning_tokens for result in results)}
+    return usage
+
+
+def persist(store, body, history):
+    try:
+        store.put(body, history)
+    except ValueError as exc:
+        raise APIError(str(exc), status=503, code="storage_limit") from exc
+
+
+async def chat_stream(service, prepared, body, request, completion_id, created, store):
+    results, choices = [], []
+    def chunk(delta, reason=None, index=0, logprobs=None):
         return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
-                "model": body.model, "choices": [{"index": 0, "delta": delta,
-                                                  "finish_reason": reason, "logprobs": None}]}
+                "model": body.model, "choices": [{"index": index, "delta": delta,
+                                                  "finish_reason": reason, "logprobs": logprobs}]}
+    for index in range(body.n):
+        options = replace(prepared.options, seed=(body.seed + index) % 2**64) if body.seed is not None else prepared.options
+        current = replace(prepared, options=options)
+        yield sse(chunk({"role": "assistant", "content": ""}, index=index))
+        async with aclosing(generation_events(service, current, request)) as events:
+            async for event in events:
+                if isinstance(event, APIError):
+                    yield sse(event.body())
+                    return
+                if isinstance(event, str):
+                    if not buffered(options):
+                        yield sse(chunk({"content": event}, index=index))
+                else:
+                    try:
+                        choice = choice_body(event, options, index)
+                    except APIError as exc:
+                        yield sse(exc.body())
+                        return
+                    if buffered(options):
+                        delta = {key: value for key, value in choice["message"].items() if key not in {"role", "refusal", "tool_calls"} and value}
+                        if delta or choice["logprobs"]:
+                            yield sse(chunk(delta, index=index, logprobs=choice["logprobs"]))
+                        for call_index, call in enumerate(choice["message"].get("tool_calls", [])):
+                            yield sse(chunk({"tool_calls": [{"index": call_index, **call}]}, index=index))
+                    results.append(event)
+                    choices.append(choice)
+                    yield sse(chunk({}, choice["finish_reason"], index=index))
+        if len(results) != index + 1:
+            return
+    final = {"id": completion_id, "object": "chat.completion", "created": created,
+             "model": body.model, "choices": choices, "usage": aggregate_usage(results),
+             "service_tier": "default", "metadata": body.metadata}
+    if body.store:
+        try:
+            persist(store, final, [item.model_dump(exclude_none=True) for item in body.messages])
+        except APIError as exc:
+            yield sse(exc.body())
+            return
+    if body.stream_options and body.stream_options.include_usage:
+        usage = chunk({})
+        usage["choices"], usage["usage"] = [], final["usage"]
+        yield sse(usage)
+    yield sse("[DONE]")
 
-    yield sse(chunk({"role": "assistant", "content": ""}))
-    async with aclosing(generation_events(service, prepared, request)) as events:
-        async for event in events:
-            if isinstance(event, APIError):
-                yield sse(event.body())
-                return
-            if isinstance(event, str):
-                yield sse(chunk({"content": event}))
-            else:
-                yield sse(chunk({}, event.finish_reason))
-                if body.stream_options and body.stream_options.include_usage:
-                    usage = chunk({})
-                    usage["choices"] = []
-                    usage["usage"] = chat_usage(event)
-                    yield sse(usage)
-                yield sse("[DONE]")
-                return
 
-
-async def responses_stream(service, prepared, body, request, response_id, created, item_id):
+async def responses_stream(service, prepared, body, request, response_id, created, item_id, store, history):
     sequence = 0
-
     def event(kind, **fields):
         nonlocal sequence
         value = {"type": kind, "sequence_number": sequence, **fields}
         sequence += 1
         return sse(value, kind)
-
     initial = response_body(body, response_id, created, item_id)
     yield event("response.created", response=initial)
     yield event("response.in_progress", response=initial)
-    item = output_message(item_id, status="in_progress")
-    item["content"] = []
-    yield event("response.output_item.added", output_index=0, item=item)
-    part = output_message(item_id)["content"][0]
+    defer = buffered(prepared.options)
     positions = {"item_id": item_id, "output_index": 0, "content_index": 0}
-    yield event("response.content_part.added", **positions, part=part)
+    if not defer:
+        item = output_message(item_id, status="in_progress")
+        item["content"] = []
+        yield event("response.output_item.added", output_index=0, item=item)
+        yield event("response.content_part.added", **positions, part=output_message(item_id)["content"][0])
     async with aclosing(generation_events(service, prepared, request)) as events:
         async for value in events:
             if isinstance(value, APIError):
                 yield event("error", code=value.code, message=str(value), param=value.param)
                 return
             if isinstance(value, str):
-                yield event("response.output_text.delta", **positions, delta=value, logprobs=[])
-            else:
+                if not defer:
+                    yield event("response.output_text.delta", **positions, delta=value, logprobs=[])
+                continue
+            try:
                 final = response_body(body, response_id, created, item_id, value)
-                item = final["output"][0]
-                yield event("response.output_text.done", **positions, text=value.text, logprobs=[])
-                yield event("response.content_part.done", **positions, part=item["content"][0])
-                yield event("response.output_item.done", output_index=0, item=item)
-                kind = "response.incomplete" if value.finish_reason == "length" else "response.completed"
-                yield event(kind, response=final)
+                if body.store:
+                    persist(store, final, history)
+            except APIError as exc:
+                yield event("error", code=exc.code, message=str(exc), param=exc.param)
                 return
+            for output_index, item in enumerate(final["output"]):
+                positions = {"item_id": item["id"], "output_index": output_index}
+                if defer:
+                    start = {**item, "status": "in_progress"}
+                    if item["type"] == "function_call":
+                        start["arguments"] = ""
+                    elif item["type"] == "message":
+                        start["content"] = []
+                    elif item["type"] == "reasoning":
+                        start["summary"], start["content"] = [], []
+                    yield event("response.output_item.added", output_index=output_index, item=start)
+                if item["type"] == "function_call":
+                    yield event("response.function_call_arguments.delta", **positions, delta=item["arguments"])
+                    yield event("response.function_call_arguments.done", **positions, arguments=item["arguments"])
+                elif item["type"] == "message":
+                    positions["content_index"] = 0
+                    part = item["content"][0]
+                    if defer:
+                        yield event("response.content_part.added", **positions, part={**part, "text": "", "logprobs": []})
+                        yield event("response.output_text.delta", **positions, delta=part["text"], logprobs=part["logprobs"])
+                    yield event("response.output_text.done", **positions, text=part["text"], logprobs=part["logprobs"])
+                    yield event("response.content_part.done", **positions, part=part)
+                else:
+                    for summary_index, part in enumerate(item["summary"]):
+                        yield event("response.reasoning_summary_part.added", **positions, summary_index=summary_index, part={**part, "text": ""})
+                        yield event("response.reasoning_summary_text.delta", **positions, summary_index=summary_index, delta=part["text"])
+                        yield event("response.reasoning_summary_text.done", **positions, summary_index=summary_index, text=part["text"])
+                        yield event("response.reasoning_summary_part.done", **positions, summary_index=summary_index, part=part)
+                yield event("response.output_item.done", output_index=output_index, item=item)
+            kind = "response.incomplete" if value.finish_reason == "length" else "response.completed"
+            yield event(kind, response=final)
+            return
 
 
 def add_chat_routes(app: FastAPI, registry: ModelRegistry):
+    store = ResponseStore()
+    app.state.response_store = store
+
+    def stored(identifier, object_type):
+        try:
+            value, history = store.get(identifier)
+        except KeyError as exc:
+            raise APIError("stored response not found or expired", status=404, code="response_not_found") from exc
+        if value["object"] != object_type:
+            raise APIError("stored response not found", status=404, code="response_not_found")
+        return value, history
+
+    def remove_stored(identifier, object_type):
+        stored(identifier, object_type)
+        try:
+            store.delete(identifier)
+        except KeyError as exc:
+            raise APIError("stored response not found or expired", status=404, code="response_not_found") from exc
+
     def resolve(model):
         try:
             return registry.resolve(model, operation="generation")
@@ -331,34 +382,87 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
             return await request_validation_exception_handler(request, exc)
         error = exc.errors()[0]
         param = ".".join(str(part) for part in error["loc"] if part != "body")
-        return JSONResponse(APIError(error["msg"], param=param).body(), status_code=400)
+        message = f"Unsupported request field: {param}" if error["type"] == "extra_forbidden" else error["msg"]
+        return JSONResponse(APIError(message, param=param).body(), status_code=400)
 
     @app.post("/v1/chat/completions")
     def chat_completions(body: ChatCompletionRequest, request: Request):
         service = resolve(body.model)
-        prepared = prepare(service, body.model, [item.message() for item in body.messages], body.options())
+        options = body.options()
+        prepared = prepare(service, body.model, [item.message() for item in body.messages], options)
         completion_id, created = f"chatcmpl-{uuid4().hex}", int(time.time())
         if body.stream:
             return StreamingResponse(
-                chat_stream(service, prepared, body, request, completion_id, created),
+                chat_stream(service, prepared, body, request, completion_id, created, store),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        result = generate(service, prepared)
-        return {
+        results, choices = [], []
+        for index in range(body.n):
+            current = replace(options, seed=(body.seed + index) % 2**64) if body.seed is not None else options
+            result = generate(service, replace(prepared, options=current))
+            results.append(result)
+            choices.append(choice_body(result, current, index))
+        final = {
             "id": completion_id, "object": "chat.completion", "created": created, "model": body.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": result.text, "refusal": None},
-                         "finish_reason": result.finish_reason, "logprobs": None}],
-            "usage": chat_usage(result),
+            "choices": choices, "usage": aggregate_usage(results), "service_tier": "default", "metadata": body.metadata,
         }
+        if body.store:
+            persist(store, final, [item.model_dump(exclude_none=True) for item in body.messages])
+        return final
 
     @app.post("/v1/responses")
     def responses(body: ResponsesRequest, request: Request):
         service = resolve(body.model)
-        prepared = prepare(service, body.model, body.messages(), body.options())
+        history = body.input_items()
+        if body.previous_response_id:
+            previous, previous_input = stored(body.previous_response_id, "response")
+            if previous["model"] != body.model:
+                raise APIError("previous_response_id belongs to another model", param="previous_response_id")
+            history = previous_input + previous["output"] + history
+        for item in history:
+            item.setdefault("id", "item_" + uuid4().hex)
+        prepared = prepare(service, body.model, body.messages(history), body.options())
         response_id, item_id, created = f"resp_{uuid4().hex}", f"msg_{uuid4().hex}", int(time.time())
         if body.stream:
             return StreamingResponse(
-                responses_stream(service, prepared, body, request, response_id, created, item_id),
+                responses_stream(service, prepared, body, request, response_id, created, item_id, store, history),
                 media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        return response_body(body, response_id, created, item_id, generate(service, prepared))
+        final = response_body(body, response_id, created, item_id, generate(service, prepared))
+        if body.store:
+            persist(store, final, history)
+        return final
+
+    @app.get("/v1/responses/{response_id}")
+    def get_response(response_id: str):
+        return stored(response_id, "response")[0]
+
+    @app.delete("/v1/responses/{response_id}")
+    def delete_response(response_id: str):
+        remove_stored(response_id, "response")
+        return {"id": response_id, "object": "response.deleted", "deleted": True}
+
+    @app.get("/v1/responses/{response_id}/input_items")
+    def input_items(response_id: str, limit: int = 20, order: str = "desc", after: str | None = None, before: str | None = None):
+        if not 1 <= limit <= 100 or order not in {"asc", "desc"} or (after and before):
+            raise APIError("invalid input_items pagination")
+        items = stored(response_id, "response")[1]
+        if order == "desc":
+            items.reverse()
+        if after or before:
+            index = next((index for index, item in enumerate(items) if item["id"] == (after or before)), None)
+            if index is None:
+                raise APIError("input item cursor not found")
+            items = items[index + 1:] if after else items[:index]
+        page = items[:limit]
+        return {"object": "list", "data": page, "has_more": len(items) > limit,
+                "first_id": page[0]["id"] if page else None, "last_id": page[-1]["id"] if page else None}
+
+    @app.get("/v1/chat/completions/{completion_id}")
+    def get_completion(completion_id: str):
+        return stored(completion_id, "chat.completion")[0]
+
+    @app.delete("/v1/chat/completions/{completion_id}")
+    def delete_completion(completion_id: str):
+        remove_stored(completion_id, "chat.completion")
+        return {"id": completion_id, "object": "chat.completion.deleted", "deleted": True}
