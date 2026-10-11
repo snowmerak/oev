@@ -12,7 +12,7 @@ import pytest
 from oev import Decision, DecisionEngine, GenerationEngine, GenerationOptions, Option, SystemOneService
 from oev.gguf import GGUFBackend
 from oev.prompt import prepare
-from oev import serve
+from oev import cli, serve
 
 
 class FakeLlama:
@@ -122,7 +122,7 @@ def test_auto_gguf_loader_uses_native_weights_and_embedded_template(native):
     assert backend.model_name == str(path.resolve())
     assert backend.llama.options == {
         "model_path": str(path.resolve()), "n_ctx": 8192, "n_gpu_layers": 0,
-        "logits_all": False, "verbose": False,
+        "flash_attn": False, "logits_all": False, "verbose": False,
     }
     ids = backend.tokenizer.encode(backend.tokenizer.apply_chat_template([{"role": "user", "content": "Hello"}]))
     assert all(call == {"add_bos": False, "special": True} for call in backend.llama.tokenize_calls)
@@ -295,12 +295,66 @@ def test_missing_template_fails_and_closes_native_model(native, monkeypatch, tmp
 @pytest.mark.parametrize("options", [
     {"revision": "main"}, {"dtype": "bfloat16"}, {"device": "hybrid-cuda"},
     {"context_length": 1}, {"gpu_layers": -2}, {"device": "cpu", "gpu_layers": 1},
+    {"flash_attn": "true"}, {"flash_attn": 1},
 ])
 def test_invalid_gguf_options_fail_before_native_load(native, options):
     path, _ = native
     with pytest.raises(ValueError):
         DecisionEngine.from_pretrained(str(path), **options)
     assert not FakeLlama.instances
+
+
+@pytest.mark.parametrize("device, layers", [("cpu", 0), ("mps", -1)])
+def test_flash_attention_is_forwarded_to_native_context_on_cpu_and_metal(native, device, layers):
+    path, api = native
+    api.llama_supports_gpu_offload = lambda: True
+    engine = DecisionEngine.from_pretrained(str(path), device=device, flash_attn=True)
+    assert engine.backend.llama.options["flash_attn"] is True
+    assert engine.backend.llama.options["n_gpu_layers"] == layers
+    assert engine.backend.selected_logits([1, 2], [ord("b")]) == [2]
+
+
+@pytest.mark.parametrize("backend", ["hf", "mlx"])
+def test_flash_attention_rejects_other_backends_before_loading(backend):
+    with pytest.raises(ValueError, match="GGUF-only"):
+        DecisionEngine.from_pretrained("org/model", backend=backend, flash_attn=True)
+
+
+@pytest.mark.parametrize("flags, enabled", [([], False), (["--flash-attn"], True), (["--flash-attn", "--no-flash-attn"], False)])
+def test_server_flash_attention_flags_reach_native_loader(native, monkeypatch, flags, enabled):
+    path, _ = native
+    launched = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: launched.append(app))
+    serve.main(["--model", str(path), "--served-model", "local", *flags])
+    assert FakeLlama.instances[0].options["flash_attn"] is enabled
+    client = TestClient(launched[0])
+    assert client.post("/v1/responses", json={"model": "local", "input": "Hi"}).status_code == 200
+
+
+def test_json_can_override_flash_attention_cli_default_per_model(native, tmp_path, monkeypatch):
+    path, _ = native
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    config = tmp_path / "models.json"
+    config.write_text(json.dumps([
+        {"model": str(path), "served_model": "inherited"},
+        {"model": str(path), "served_model": "disabled", "flash_attn": False},
+        {"model": str(path), "served_model": "enabled", "flash_attn": True},
+    ]), encoding="utf-8")
+    serve.main(["--models-config", str(config), "--flash-attn"])
+    assert [model.options["flash_attn"] for model in FakeLlama.instances] == [True, False, True]
+
+
+def test_batch_cli_flash_attention_option_reaches_native_loader(native, tmp_path):
+    path, _ = native
+    source = tmp_path / "cases.jsonl"
+    source.write_text(json.dumps({
+        "state": "Hello", "question": "Which greeting?",
+        "options": [{"id": "a", "description": "Hello"}, {"id": "b", "description": "Bye"}],
+    }) + "\n", encoding="utf-8")
+    output = tmp_path / "result.jsonl"
+    assert cli.main(["--model", str(path), "--flash-attn", "--input", str(source), "--output", str(output)]) == 0
+    assert FakeLlama.instances[0].options["flash_attn"] is True
+    assert json.loads(output.read_text(encoding="utf-8"))["selected_id"] == "b"
 
 
 def test_downloaded_hf_folder_and_cache_only_id_forward_offline_option(monkeypatch, tmp_path):
@@ -345,6 +399,10 @@ def test_mlx_quantized_directory_has_an_explicit_format_error(tmp_path):
     {"model": "local.gguf", "device": "cpu", "gpu_layers": 1},
     {"model": "local.gguf", "device": "cuda", "gpu_layers": 0},
     {"model": "org/hf", "gpu_layers": 0},
+    {"model": "org/hf", "flash_attn": True},
+    {"model": "mlx-community/model", "flash_attn": True},
+    {"model": "local.gguf", "flash_attn": "true"},
+    {"model": "local.gguf", "flash_attn": 1},
 ])
 def test_invalid_mixed_config_is_rejected_before_loading_any_models(tmp_path, monkeypatch, entry):
     calls = []
@@ -364,11 +422,13 @@ def test_cli_config_can_mix_downloaded_hf_and_gguf(native, tmp_path, monkeypatch
     config = tmp_path / "models.json"
     config.write_text(json.dumps([
         {"model": "org/model", "served_model": "hf", "local_files_only": True, "dtype": "bfloat16"},
-        {"model": str(path), "served_model": "gguf", "context_length": 2048, "max_input_tokens": 1024, "gpu_layers": 0},
+        {"model": str(path), "served_model": "gguf", "context_length": 2048, "max_input_tokens": 1024, "gpu_layers": 0, "flash_attn": True},
     ]), encoding="utf-8")
     serve.main(["--models-config", str(config)])
     assert calls[0][1]["local_files_only"] is True
+    assert calls[0][1]["flash_attn"] is False
     assert calls[1][1]["context_length"] == 2048 and calls[1][1]["gpu_layers"] == 0
+    assert calls[1][1]["flash_attn"] is True
     assert len(launched) == 1
 
 
@@ -412,7 +472,11 @@ def test_real_downloaded_gguf_when_explicitly_configured():
     if not source:
         pytest.skip("set OEV_TEST_GGUF_PATH to a local text GGUF to exercise the native runtime")
     pytest.importorskip("llama_cpp")
-    backend = GGUFBackend.load(source, device="cpu", context_length=2048)
+    flash_attn = os.environ.get("OEV_TEST_GGUF_FLASH_ATTN", "0")
+    if flash_attn not in {"0", "1"}:
+        pytest.fail("OEV_TEST_GGUF_FLASH_ATTN must be 0 or 1")
+    backend = GGUFBackend.load(source, device=os.environ.get("OEV_TEST_GGUF_DEVICE", "cpu"),
+                               context_length=2048, flash_attn=flash_attn == "1")
     try:
         generation = GenerationEngine(backend, max_input_tokens=1024)
         prepared = generation.prepare([{"role": "user", "content": "Say hello."}], GenerationOptions(4))

@@ -155,7 +155,7 @@ For different devices, revisions, or limits, use `--models-config` with a nonemp
 uv run --locked --extra hf --extra serve oev-serve --models-config examples/models.json
 ```
 
-Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, `max_concurrency`, `backend`, `local_files_only`, `context_length`, `gpu_layers`, and `chat_template`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
+Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, `max_concurrency`, `backend`, `local_files_only`, `context_length`, `gpu_layers`, `chat_template`, and `flash_attn`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
 
 `GET /v1/models` lists all served names in configuration order in both `models` and `data`. For example, use `model="fast"` for a decision and `model="large"` for a generated reply. An unknown name returns `422` for System One or `404` with `model_not_found` for generation, before any inference.
 
@@ -208,7 +208,29 @@ uv run --locked --extra gguf --extra serve oev-serve --model "C:/path/to/model.Q
 
 GGUF support uses the optional [llama-cpp-python runtime](https://llama-cpp-python.readthedocs.io/en/latest/), which must support the model's architecture. Installing this extra may require a native compiler; GPU offload requires a build for your GPU backend. It loads quantized weights directly without converting them to Transformers weights. Selection, Responses, Chat Completions, and SSE all reuse that loaded instance.
 
-GGUF `device=auto` defaults to CPU. Set `gpu_layers`/`--gpu-layers` to the number of layers to offload, or `-1` for all, with a GPU-capable runtime. `device=cuda` or `mps` requests all layers by default; the installed native runtime determines the GPU backend. `device=cpu` requires zero offloaded layers. `context_length` defaults to 8,192 and includes prompt plus requested output. The GGUF's quantization determines its weight type, so `dtype` must remain `auto`. `revision` is supported by HF and MLX; `hybrid-cuda` is HF-only. `context_length`, `gpu_layers`, and `chat_template` are GGUF-only options.
+GGUF `device=auto` defaults to CPU. Set `gpu_layers`/`--gpu-layers` to the number of layers to offload, or `-1` for all, with a GPU-capable runtime. `device=cuda` or `mps` requests all layers by default; the installed native runtime determines the GPU backend. `device=cpu` requires zero offloaded layers. `context_length` defaults to 8,192 and includes prompt plus requested output. The GGUF's quantization determines its weight type, so `dtype` must remain `auto`. `revision` is supported by HF and MLX; `hybrid-cuda` is HF-only. `context_length`, `gpu_layers`, `chat_template`, and enabling `flash_attn` are GGUF-only options.
+
+#### GGUF Flash Attention
+
+Flash Attention is included in the existing `gguf` dependency (`llama-cpp-python>=0.3.36,<0.4`). The separate PyTorch/CUDA `flash-attn` package is not required by this backend. Use `--flash-attn` to request native Flash Attention; `--no-flash-attn` explicitly disables it. Both `oev` and `oev-serve` accept these flags, and the default remains disabled. The Python loader accepts `DecisionEngine.from_pretrained(path, backend="gguf", flash_attn=True)`.
+
+For mixed model configs, set `"flash_attn": true` on the GGUF entry. It must be a JSON boolean, and omitted values inherit the CLI default. HF and MLX entries reject enabling it; when using a global `--flash-attn` with mixed backends, explicitly set `"flash_attn": false` on other entries. This option is set when loading the model, so restart the server after changing it. Actual kernel availability and activation depend on the model and installed native build; the flag requests activation rather than guaranteeing compatibility or a speedup.
+
+On Mac Studio, a Metal-capable runtime and `device=mps` enable GPU offload. If your installed runtime lacks GPU offload, [build llama-cpp-python with Metal](https://llama-cpp-python.readthedocs.io/en/latest/#supported-backends) using an arm64 Python and Xcode command-line tools:
+
+```bash
+CMAKE_ARGS="-DGGML_METAL=on" uv sync --locked --extra gguf --extra serve --reinstall-package llama-cpp-python --no-binary-package llama-cpp-python
+```
+
+With the model path edited in [examples/models-gguf-metal.json](examples/models-gguf-metal.json), run:
+
+```bash
+uv run --locked --extra gguf --extra serve oev-serve --models-config examples/models-gguf-metal.json
+# Or load one model directly:
+uv run --locked --extra gguf --extra serve oev-serve --model "/path/to/model.gguf" --device mps --flash-attn
+```
+
+The JSON example selects Metal with Flash Attention. Enabling Flash Attention alone leaves your selected device and GPU offload settings unchanged; a CPU config stays on CPU.
 
 The model's embedded Jinja chat template is used with `enable_thinking=False`. If absent, provide `--chat-template path/to/chat.jinja` (or `chat_template` in JSON) with the correct template. The same exact single-token answer-label and prompt-boundary validation applies to GGUF decisions; incompatible tokenizers fail clearly. All native end-of-generation tokens, including end-of-turn markers, stop generation and count toward usage without appearing in output text.
 
@@ -237,6 +259,15 @@ uv run --locked --extra gguf --extra serve --extra test python -m pytest -q test
 ```
 
 Without that environment variable, the real GGUF test is skipped; simulated tests do not establish compatibility with every GGUF architecture.
+
+To exercise the real GGUF runtime with Flash Attention requested on Metal, use these settings on your Mac. The test checks selection and repeated generation using the native runtime; it does not measure performance or verify which kernel the runtime ultimately selected:
+
+```bash
+export OEV_TEST_GGUF_PATH="/path/to/model.gguf"
+export OEV_TEST_GGUF_DEVICE=mps
+export OEV_TEST_GGUF_FLASH_ATTN=1
+uv run --locked --extra gguf --extra serve --extra test python -m pytest -q tests/test_local_models.py::test_real_downloaded_gguf_when_explicitly_configured
+```
 
 ### MLX on Mac Studio
 

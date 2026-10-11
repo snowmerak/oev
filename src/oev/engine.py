@@ -56,7 +56,10 @@ class DecisionEngine:
         context_length: int = 8192,
         gpu_layers: int | None = None,
         chat_template: str | None = None,
+        flash_attn: bool = False,
     ) -> "DecisionEngine":
+        if type(flash_attn) is not bool:
+            raise ValueError("flash_attn must be a boolean")
         source = str(Path(model).expanduser()) if Path(model).expanduser().exists() or model.startswith("~") else model
         selected_backend = model_backend(source, backend)
         if selected_backend == "gguf":
@@ -67,8 +70,10 @@ class DecisionEngine:
             if max_input_tokens > context_length:
                 raise ValueError("max_input_tokens must not exceed GGUF context_length")
             loaded = GGUFBackend.load(source, device=device, context_length=context_length,
-                                      gpu_layers=gpu_layers, chat_template=chat_template)
+                                      gpu_layers=gpu_layers, chat_template=chat_template, flash_attn=flash_attn)
             return cls(loaded, max_input_tokens=max_input_tokens)
+        if flash_attn:
+            raise ValueError("flash_attn is a GGUF-only option")
         if gpu_layers is not None or chat_template is not None or context_length != 8192:
             raise ValueError("context_length, gpu_layers, and chat_template are GGUF-only options")
         if selected_backend == "mlx":

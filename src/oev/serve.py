@@ -138,6 +138,7 @@ class ModelConfig(BaseModel):
     context_length: int = Field(default=8192, ge=1, strict=True)
     gpu_layers: int | None = Field(default=None, ge=-1, strict=True)
     chat_template: str | None = None
+    flash_attn: bool = Field(default=False, strict=True)
 
     @field_validator("model", "served_model", "revision")
     @classmethod
@@ -157,6 +158,7 @@ def model_configs(args, parser) -> list[ModelConfig]:
         "max_input_tokens": args.max_input_tokens, "max_concurrency": args.max_concurrency,
         "backend": args.backend, "local_files_only": args.local_files_only,
         "context_length": args.context_length, "gpu_layers": args.gpu_layers, "chat_template": args.chat_template,
+        "flash_attn": args.flash_attn,
     }
     if args.models_config:
         if args.model or args.served_model:
@@ -186,6 +188,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
         except ValueError as exc:
             parser.error(f"model {config.name!r}: {exc}")
         gguf = backend == "gguf"
+        if config.flash_attn and not gguf:
+            parser.error(f"model {config.name!r}: flash_attn is a GGUF-only option")
         if gguf:
             if config.dtype != "auto" or config.revision is not None or config.device == "hybrid-cuda":
                 parser.error(f"model {config.name!r}: GGUF does not accept dtype, revision, or hybrid-cuda")
@@ -215,6 +219,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size, including generated tokens")
     parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all; auto/cpu defaults to 0")
     parser.add_argument("--chat-template", help="GGUF: override embedded chat template with a Jinja file")
+    parser.add_argument("--flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="GGUF: request native Flash Attention (default: disabled)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
@@ -242,6 +248,7 @@ def main(argv: list[str] | None = None) -> None:
             max_input_tokens=config.max_input_tokens,
             backend=config.backend, local_files_only=config.local_files_only,
             context_length=config.context_length, gpu_layers=config.gpu_layers, chat_template=config.chat_template,
+            flash_attn=config.flash_attn,
         )
         services.append(SystemOneService(engine, config.name, max_concurrency=config.max_concurrency))
     service = services[0] if len(services) == 1 else ModelRegistry(services)

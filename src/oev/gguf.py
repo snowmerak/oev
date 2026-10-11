@@ -37,7 +37,7 @@ class GGUFBackend:
         self._lock = Lock()
 
     @classmethod
-    def load(cls, source, *, device="auto", context_length=8192, gpu_layers=None, chat_template=None):
+    def load(cls, source, *, device="auto", context_length=8192, gpu_layers=None, chat_template=None, flash_attn=False):
         path = Path(source).expanduser()
         if not path.is_file() or path.suffix.lower() != ".gguf":
             raise ValueError("GGUF models require the path to an existing .gguf file")
@@ -47,6 +47,8 @@ class GGUFBackend:
             raise ValueError("context_length must be a positive integer")
         if gpu_layers is not None and (type(gpu_layers) is not int or gpu_layers < -1):
             raise ValueError("gpu_layers must be -1 or a nonnegative integer")
+        if type(flash_attn) is not bool:
+            raise ValueError("flash_attn must be a boolean")
         layers = gpu_layers if gpu_layers is not None else -1 if device in {"cuda", "mps"} else 0
         if device == "cpu" and layers != 0:
             raise ValueError("device=cpu requires gpu_layers=0")
@@ -60,7 +62,7 @@ class GGUFBackend:
         if layers != 0 and not api.llama_supports_gpu_offload():
             raise ValueError("this llama-cpp-python build does not support GPU offload")
         llama = Llama(model_path=str(path.resolve()), n_ctx=context_length, n_gpu_layers=layers,
-                      logits_all=False, verbose=False)
+                      flash_attn=flash_attn, logits_all=False, verbose=False)
         try:
             template = Path(chat_template).expanduser().read_text(encoding="utf-8") if chat_template else llama.metadata.get("tokenizer.chat_template")
             if not isinstance(template, str) or not template.strip():

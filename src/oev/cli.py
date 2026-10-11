@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--context-length", type=int, default=8192, help="GGUF context size including output tokens")
     parser.add_argument("--gpu-layers", type=int, help="GGUF layers to offload; -1 for all")
     parser.add_argument("--chat-template", help="GGUF chat template override (Jinja file)")
+    parser.add_argument("--flash-attn", action=argparse.BooleanOptionalAction, default=False,
+                        help="GGUF: request native Flash Attention (default: disabled)")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps", "hybrid-cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
@@ -38,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         max_input_tokens=args.max_input_tokens,
         backend=args.backend, local_files_only=args.local_files_only, context_length=args.context_length,
         gpu_layers=args.gpu_layers, chat_template=args.chat_template,
+        flash_attn=args.flash_attn,
     )
     print(f"loaded {args.model} in {time.perf_counter() - loaded_at:.2f}s", file=sys.stderr)
 
