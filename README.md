@@ -142,7 +142,20 @@ Model IDs or local paths are served as their names by default. To assign aliases
 uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it --served-model fast --model google/gemma-4-E4B-it --served-model large --device cpu --dtype bfloat16
 ```
 
-For different devices, revisions, or limits, use `--models-config` with a nonempty JSON array. See [examples/models.json](examples/models.json) for a hybrid-CUDA model alongside a CPU model:
+For different devices, revisions, or limits, use `--models-config` with a nonempty JSON array. All model configuration examples are collected in [examples/models.json](examples/models.json), grouped by backend and identified by descriptive `served_model` names:
+
+| `served_model` | Example |
+| --- | --- |
+| `hf-repo-hybrid-cuda` | HF repository on hybrid CUDA/CPU |
+| `hf-repo-cpu` | HF repository on CPU |
+| `hf-local-cpu` | Offline Transformers directory on CPU |
+| `gguf-local-cpu` | Local GGUF on CPU |
+| `gguf-local-metal-flash-attn` | Local GGUF on Metal with Flash Attention requested |
+| `mlx-local-small-metal`, `mlx-local-large-metal` | Two offline MLX directories on Metal |
+
+Copy the entries you want into `config.json` as a JSON array, and replace the example model paths. Keep only the entries supported by your machine and needed for this server: every entry is loaded, including separate instances when two entries point to the same checkpoint. JSON has no comments; the served names explain each example and are also the model names clients send in API requests.
+
+For example, a custom config serving a hybrid-CUDA model alongside a CPU model can contain:
 
 ```json
 [
@@ -152,7 +165,7 @@ For different devices, revisions, or limits, use `--models-config` with a nonemp
 ```
 
 ```powershell
-uv run --locked --extra hf --extra serve oev-serve --models-config examples/models.json
+uv run --locked --extra hf --extra serve oev-serve --models-config config.json
 ```
 
 Each entry requires `model` and may set `served_model`, `revision`, `device`, `dtype`, `max_input_tokens`, `max_concurrency`, `backend`, `local_files_only`, `context_length`, `gpu_layers`, `chat_template`, and `flash_attn`. Omitted loading options inherit CLI defaults, including `OEV_MAX_CONCURRENCY`; explicit entry values override them. `--models-config` cannot be combined with `--model` or `--served-model`. Served names must be unique; aliases let you load the same checkpoint with different revisions or devices as separate instances.
@@ -222,24 +235,24 @@ On Mac Studio, a Metal-capable runtime and `device=mps` enable GPU offload. If y
 CMAKE_ARGS="-DGGML_METAL=on" uv sync --locked --extra gguf --extra serve --reinstall-package llama-cpp-python --no-binary-package llama-cpp-python
 ```
 
-With the model path edited in [examples/models-gguf-metal.json](examples/models-gguf-metal.json), run:
+Copy the `gguf-local-metal-flash-attn` entry from [examples/models.json](examples/models.json) into `config.json` as a JSON array and edit its model path, then run:
 
 ```bash
-uv run --locked --extra gguf --extra serve oev-serve --models-config examples/models-gguf-metal.json
+uv run --locked --extra gguf --extra serve oev-serve --models-config config.json
 # Or load one model directly:
 uv run --locked --extra gguf --extra serve oev-serve --model "/path/to/model.gguf" --device mps --flash-attn
 ```
 
-The JSON example selects Metal with Flash Attention. Enabling Flash Attention alone leaves your selected device and GPU offload settings unchanged; a CPU config stays on CPU.
+That entry selects Metal with Flash Attention. Enabling Flash Attention alone leaves your selected device and GPU offload settings unchanged; a CPU config stays on CPU.
 
 The model's embedded Jinja chat template is used with `enable_thinking=False`. If absent, provide `--chat-template path/to/chat.jinja` (or `chat_template` in JSON) with the correct template. The same exact single-token answer-label and prompt-boundary validation applies to GGUF decisions; incompatible tokenizers fail clearly. All native end-of-generation tokens, including end-of-turn markers, stop generation and count toward usage without appearing in output text.
 
 One GGUF instance owns one mutable native KV context. Requests to that instance are serialized internally, even if `max_concurrency` is larger than one; different models can still run independently. Cancellation is observed between prompt batches and generation forwards, and closing a stream resets the context and releases its lock. GGUF selection computes the native full vocabulary logits and reads the requested answer tokens; HF's Gemma-specific projection optimization does not apply to this backend.
 
-To mix offline HF and GGUF models, edit the paths in [examples/models-local.json](examples/models-local.json), then run:
+To mix offline HF and GGUF models, copy the `hf-local-cpu` and `gguf-local-cpu` entries from [examples/models.json](examples/models.json) into `config.json` as a JSON array, edit their paths, then run:
 
 ```powershell
-uv run --locked --extra hf --extra gguf --extra serve oev-serve --models-config examples/models-local.json
+uv run --locked --extra hf --extra gguf --extra serve oev-serve --models-config config.json
 ```
 
 Relative paths are resolved from the server's working directory. Local sources are loaded directly without LM Studio running. Model directories are not scanned automatically; pass the actual downloaded path.
@@ -285,10 +298,10 @@ For an HF repository, use `--backend mlx --model owner/model`; add `--local-file
 
 The checkpoint's tokenizer chat template and EOS/end-of-turn token IDs are used. Prompts obey `max_input_tokens`; prompt plus requested output also obeys `max_position_embeddings` when declared in the config. MLX computes final-token vocabulary logits and selects the answer rows; HF's Gemma-specific projection optimization does not apply. Available architectures depend on the installed `mlx-lm` version.
 
-To keep multiple MLX models loaded, edit the paths in [examples/models-mlx.json](examples/models-mlx.json), then run:
+To keep multiple MLX models loaded, copy the `mlx-local-small-metal` and `mlx-local-large-metal` entries from [examples/models.json](examples/models.json) into `config.json` as a JSON array, edit their paths, then run:
 
 ```bash
-uv run --locked --extra mlx --extra serve oev-serve --models-config examples/models-mlx.json
+uv run --locked --extra mlx --extra serve oev-serve --models-config config.json
 ```
 
 Windows tests use a simulated MLX runtime to cover loading, cache isolation, sampling, API responses, SSE, serialization, cancellation, and failures. The following opt-in test runs real Metal inference on your Mac, comparing greedy output with `mlx-lm.generate_step`, checking selection logits against a full forward, and checking repeated requests for cache contamination:

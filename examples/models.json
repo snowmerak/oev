@@ -1,7 +1,8 @@
 [
   {
     "model": "google/gemma-4-E2B-it",
-    "served_model": "fast",
+    "served_model": "hf-repo-hybrid-cuda",
+    "backend": "hf",
     "device": "hybrid-cuda",
     "dtype": "bfloat16",
     "max_input_tokens": 4096,
@@ -9,10 +10,59 @@
   },
   {
     "model": "google/gemma-4-E4B-it",
-    "served_model": "large",
+    "served_model": "hf-repo-cpu",
+    "backend": "hf",
     "device": "cpu",
     "dtype": "bfloat16",
     "max_input_tokens": 8192,
     "max_concurrency": 2
+  },
+  {
+    "model": "./models/hf-checkpoint",
+    "served_model": "hf-local-cpu",
+    "backend": "hf",
+    "local_files_only": true,
+    "device": "cpu",
+    "dtype": "bfloat16",
+    "max_concurrency": 2
+  },
+  {
+    "model": "./models/model.Q4_K_M.gguf",
+    "served_model": "gguf-local-cpu",
+    "backend": "gguf",
+    "device": "cpu",
+    "context_length": 8192,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/model.Q4_K_M.gguf",
+    "served_model": "gguf-local-metal-flash-attn",
+    "backend": "gguf",
+    "device": "mps",
+    "flash_attn": true,
+    "context_length": 8192,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/mlx-small",
+    "served_model": "mlx-local-small-metal",
+    "backend": "mlx",
+    "device": "auto",
+    "dtype": "auto",
+    "local_files_only": true,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
+  },
+  {
+    "model": "./models/mlx-large",
+    "served_model": "mlx-local-large-metal",
+    "backend": "mlx",
+    "device": "auto",
+    "dtype": "auto",
+    "local_files_only": true,
+    "max_input_tokens": 4096,
+    "max_concurrency": 1
   }
 ]
