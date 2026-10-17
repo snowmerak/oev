@@ -164,6 +164,7 @@ class ModelConfig(BaseModel):
     embedding_query_prefix: str | None = None
     embedding_document_prefix: str | None = None
     gguf_server_path: str | None = None
+    mmproj_path: str | None = None
 
     @field_validator("tool_call_parser", "reasoning_parser")
     @classmethod
@@ -260,6 +261,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
             parser.error(f"model {config.name!r}: prompt caching requires generation on HF/GGUF/MLX; hybrid-cuda is unsupported")
         if config.gguf_server_path is not None and (not gguf or config.task != "embedding"):
             parser.error(f"model {config.name!r}: gguf_server_path requires a GGUF embedding model")
+        if config.mmproj_path is not None and (not gguf or config.task != "embedding" or not config.gguf_server_path):
+            parser.error(f"model {config.name!r}: mmproj_path requires a GGUF embedding model with gguf_server_path")
         if config.task == "embedding" and config.chat_template is not None:
             parser.error(f"model {config.name!r}: embedding models do not use chat_template")
         if config.task == "embedding" and (config.tool_call_parser != "auto" or config.reasoning_parser != "auto"
@@ -301,6 +304,7 @@ def _load_service(config: ModelConfig):
             context_length=config.context_length, gpu_layers=config.gpu_layers, flash_attn=config.flash_attn,
             pooling=config.pooling, query_prefix=config.embedding_query_prefix,
             document_prefix=config.embedding_document_prefix, gguf_server_path=config.gguf_server_path,
+            mmproj_path=config.mmproj_path,
         )
     gguf = model_backend(config.model, config.backend) == "gguf"
     template = Path(config.chat_template).expanduser().read_text(encoding="utf-8") if config.chat_template and not gguf else None

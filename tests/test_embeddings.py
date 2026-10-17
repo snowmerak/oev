@@ -176,6 +176,9 @@ def test_cli_mixed_tasks_load_once_and_forward_embedding_options(monkeypatch, tm
     {"embedding_query_prefix": "Q: "}, {"pooling": "last"}, {"task": "unknown"},
     {"task": "embedding", "backend": "hf", "gguf_server_path": "llama-server"},
     {"backend": "gguf", "gguf_server_path": "llama-server"},
+    {"task": "embedding", "backend": "hf", "mmproj_path": "mmproj.gguf"},
+    {"task": "embedding", "backend": "gguf", "mmproj_path": "mmproj.gguf"},
+    {"backend": "gguf", "gguf_server_path": "llama-server", "mmproj_path": "mmproj.gguf"},
 ])
 def test_invalid_embedding_config_is_rejected_before_loading(monkeypatch, tmp_path, entry):
     monkeypatch.setattr(serve.EmbeddingService, "from_pretrained", lambda *a, **k: pytest.fail("must not load"))
@@ -205,14 +208,14 @@ def test_later_model_load_failure_closes_resident_embedding_worker(monkeypatch, 
     assert closed == [True]
 
 
-def test_hf_gemma2_loads_text_only_with_safe_dtype_and_offline_files(monkeypatch, tmp_path):
+def test_hf_gemma2_retains_media_towers_with_safe_dtype_and_offline_files(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     calls = []
 
     def config(source, **kwargs):
         assert kwargs["local_files_only"] is True and kwargs["trust_remote_code"] is False
-        return SimpleNamespace(model_type="embedding_gemma2")
+        return SimpleNamespace(model_type="embedding_gemma2", vision_config=object(), audio_config=object())
 
     def load(source, **kwargs):
         calls.append(kwargs)
@@ -222,7 +225,8 @@ def test_hf_gemma2_loads_text_only_with_safe_dtype_and_offline_files(monkeypatch
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=load))
     backend = HFEmbeddingBackend.load(str(tmp_path), device="cpu")
     assert backend.dimension == 768
-    assert calls[0]["config_kwargs"] == {"vision_config": None, "audio_config": None}
+    assert calls[0]["config_kwargs"] == {}
+    assert backend.modalities == {"text", "image", "audio"}
     assert calls[0]["model_kwargs"]["torch_dtype"] == torch.float32
     assert calls[0]["local_files_only"] is True
     with pytest.raises(ValueError, match="float16"):
@@ -391,8 +395,8 @@ def test_mlx_embeddings_loading_and_first_forward_on_http_worker(monkeypatch, tm
         assert client.post("/v1/embeddings", json={"model": "embed", "input": ["hi", "hello"]}).status_code == 200
     assert len(loads) == 1 and loads[0]["tokenizer_config"]["local_files_only"]
     assert syncs == [backend._stream] * 3
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "embedding_gemma2"}))
-    with pytest.raises(ValueError, match="use HF or GGUF"):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "unknown_embedding"}))
+    with pytest.raises(ValueError, match="unsupported MLX embedding architecture"):
         MLXEmbeddingBackend.load(str(tmp_path))
 
 

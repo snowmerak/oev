@@ -17,8 +17,15 @@ serve = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "jsonschema>=4.23,<5"]
 # llama.cpp includes native Flash Attention; this backend needs no flash-attn wheel.
 gguf = ["llama-cpp-python>=0.3.36,<0.4"]
 mlx = ["mlx-lm>=0.32.0,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'"]
-embeddings = ["sentence-transformers[image]>=6.1,<7", "torch>=2.6", "transformers>=5.18,<6"]
-mlx-embeddings = ["mlx-embeddings>=0.1.0,<0.2; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+embeddings = ["sentence-transformers[image]>=6.1,<7", "torch>=2.6", "transformers>=5.18,<6", "soundfile>=0.13,<0.14", "scipy>=1.11,<2"]
+embedding-media = ["Pillow>=10.3,<13", "soundfile>=0.13,<0.14", "scipy>=1.11,<2"]
+mlx-embeddings = [
+    "mlx-embeddings>=0.1.0,<0.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.7.8,<0.8; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers[vision]>=5.19,<6; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "soundfile>=0.13,<0.14; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "scipy>=1.11,<2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 test = ["pytest>=8.0", "httpx>=0.27"]
 qat = [
     "compressed-tensors>=0.15,<0.17",

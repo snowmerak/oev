@@ -1,4 +1,4 @@
-"""OpenAI-compatible dense text embeddings, including float32 base64 output."""
+"""Dense embeddings with an optional multimodal input extension."""
 
 import base64
 import logging
@@ -15,9 +15,12 @@ from .models import ModelCapabilityError, ModelNotFound, ModelRegistry
 logger = logging.getLogger(__name__)
 
 
+EmbeddingInput = dict[str, str | list[str]]
+
+
 class EmbeddingRequest(APIModel):
     model: str
-    input: str | list[str] = Field(union_mode="left_to_right")
+    input: str | EmbeddingInput | list[str | EmbeddingInput] = Field(union_mode="left_to_right")
     encoding_format: Literal["float", "base64"] = "float"
     dimensions: int | None = Field(default=None, ge=1, strict=True)
     user: str | None = None
@@ -33,9 +36,9 @@ def add_embedding_routes(app: FastAPI, registry: ModelRegistry):
             raise APIError(str(exc), status=404, code="model_not_found", param="model") from exc
         except ModelCapabilityError as exc:
             raise APIError(str(exc), code="unsupported_operation", param="model") from exc
-        texts = [body.input] if isinstance(body.input, str) else body.input
+        inputs = body.input if isinstance(body.input, list) else [body.input]
         try:
-            vectors, tokens = service.embed(texts, dimensions=body.dimensions, input_type=body.input_type)
+            vectors, tokens = service.embed(inputs, dimensions=body.dimensions, input_type=body.input_type)
         except ValueError as exc:
             raise APIError(str(exc)) from exc
         except Exception as exc:

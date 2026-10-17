@@ -9,6 +9,7 @@ from threading import Lock
 
 from .engine import model_backend
 from .hf_embedding_metadata import local_pooling_defaults, pooling_loader
+from .embedding_inputs import configure_audio_processor, decode_inputs
 
 
 def _check_tokens(counts, limit):
@@ -18,10 +19,13 @@ def _check_tokens(counts, limit):
 
 
 class HFEmbeddingBackend:
-    def __init__(self, model):
+    def __init__(self, model, *, modalities=None):
         self.model = model
         self.dimension = model.get_embedding_dimension()
         self.prompts = dict(model.prompts)
+        self.modalities = frozenset(modalities or {"text"})
+        if "audio" in self.modalities and hasattr(model, "_first_module"):
+            configure_audio_processor(model._first_module().processor)
 
     @classmethod
     def load(cls, source, *, revision=None, device="auto", dtype="auto", local_files_only=False):
@@ -42,11 +46,15 @@ class HFEmbeddingBackend:
         offline = local_files_only or path.is_dir()
         config = AutoConfig.from_pretrained(source, revision=revision, local_files_only=offline, trust_remote_code=False)
         config_kwargs = {}
+        modalities = {"text"}
         if config.model_type == "embedding_gemma2":
             if dtype == "float16":
                 raise ValueError("EmbeddingGemma2 requires float32 or bfloat16; float16 produces invalid embeddings")
-            # The endpoint accepts text; omit unused vision/audio encoders.
-            config_kwargs = {"vision_config": None, "audio_config": None}
+            # Keep checkpoint towers for native cross-modal embeddings.
+            if getattr(config, "vision_config", None) is not None:
+                modalities.add("image")
+            if getattr(config, "audio_config", None) is not None:
+                modalities.add("audio")
             if dtype == "auto":
                 dtype = "float32"
         loader = pooling_loader(SentenceTransformer, local_pooling_defaults(path, config))
@@ -56,20 +64,32 @@ class HFEmbeddingBackend:
             model_kwargs={"torch_dtype": "auto" if dtype == "auto" else getattr(torch, dtype)},
             config_kwargs=config_kwargs,
         )
-        return cls(model)
+        return cls(model, modalities=modalities)
 
     def embed(self, texts, max_input_tokens):
+        if self.modalities - {"text"} or set(getattr(self.model, "modalities", ())) - {"text"}:
+            texts = [{"text": text} for text in texts]
+        return self._embed(texts, max_input_tokens)
+
+    def embed_multimodal(self, inputs, max_input_tokens, *, prompt=""):
+        return self._embed(decode_inputs(inputs), max_input_tokens, prompt=prompt)
+
+    def _embed(self, texts, max_input_tokens, *, prompt=""):
         limit = min(max_input_tokens, self.model.max_seq_length or max_input_tokens)
         # Validate before encode's automatic truncation, using the same processor.
         counts = []
+        processing_kwargs = {"text": {"truncation": False}}
+        if "audio" in self.modalities:
+            processing_kwargs["audio"] = {"truncation": False}
+        prompt_kwargs = {"prompt": prompt} if prompt else {}
         for text in texts:
-            inputs = self.model.preprocess([text], processing_kwargs={"text": {"truncation": False}})
+            inputs = self.model.preprocess([text], **prompt_kwargs, processing_kwargs=processing_kwargs)
             counts.append(int(inputs["attention_mask"].sum().item()))
         _check_tokens(counts, limit)
         vectors = self.model.encode(
-            texts, batch_size=1, show_progress_bar=False, prompt="",
+            texts, batch_size=1, show_progress_bar=False, prompt=prompt,
             normalize_embeddings=False, convert_to_numpy=True,
-            processing_kwargs={"text": {"truncation": False}},
+            processing_kwargs=processing_kwargs,
         )
         return vectors.tolist(), sum(counts)
 
@@ -83,7 +103,7 @@ class GGUFEmbeddingBackend:
 
     @classmethod
     def load(cls, source, *, device="auto", context_length=8192, gpu_layers=None,
-             flash_attn=False, pooling="auto", gguf_server_path=None):
+             flash_attn=False, pooling="auto", gguf_server_path=None, mmproj_path=None):
         path = Path(source).expanduser()
         if not path.is_file() or path.suffix.lower() != ".gguf":
             raise ValueError("GGUF embeddings require an existing local .gguf file")
@@ -102,7 +122,10 @@ class GGUFEmbeddingBackend:
             from .gguf_embedding_server import GGUFServerEmbeddingBackend
 
             return GGUFServerEmbeddingBackend(str(path), gguf_server_path, context_length=context_length,
-                                               gpu_layers=layers, flash_attn=flash_attn, pooling=pooling)
+                                               gpu_layers=layers, flash_attn=flash_attn, pooling=pooling,
+                                               mmproj_path=mmproj_path)
+        if mmproj_path is not None:
+            raise ValueError("multimodal GGUF embeddings require gguf_server_path and mmproj_path")
         try:
             from llama_cpp import Llama, llama_cpp as api
         except ImportError as exc:
@@ -159,7 +182,6 @@ class MLXEmbeddingBackend:
             raise RuntimeError("MLX embeddings require Apple Silicon macOS")
         try:
             import mlx.core as mx
-            from mlx_embeddings import load
         except ImportError as exc:
             raise RuntimeError("Install MLX embeddings with: uv sync --extra mlx-embeddings --extra serve") from exc
         if device != "cpu" and not mx.metal.is_available():
@@ -173,14 +195,22 @@ class MLXEmbeddingBackend:
             path = Path(snapshot_download(repo_id=source, revision=revision, local_files_only=local_files_only,
                                           allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken", "*.jinja"]))
         config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        prompts_path = path / "config_sentence_transformers.json"
+        prompts = json.loads(prompts_path.read_text(encoding="utf-8")).get("prompts", {}) if prompts_path.is_file() else {}
+        stream = mx.new_thread_unsafe_stream(mx.cpu if device == "cpu" else mx.gpu)
+        if config.get("model_type") == "embedding_gemma2":
+            from .mlx_embedding import MLXMultimodalEmbeddingBackend
+
+            return MLXMultimodalEmbeddingBackend.load(path, config, prompts, mx, stream)
         # These architectures expose one pooled vector of hidden_size. Gemma2's
         # projection head must not be replaced by generic mean pooling.
         if config.get("model_type") not in {"qwen3", "bert", "xlm-roberta", "xlm_roberta", "modernbert"}:
-            raise ValueError(f"unsupported MLX embedding architecture {config.get('model_type')!r}; use HF or GGUF for EmbeddingGemma2")
-        prompts_path = path / "config_sentence_transformers.json"
-        prompts = json.loads(prompts_path.read_text(encoding="utf-8")).get("prompts", {}) if prompts_path.is_file() else {}
+            raise ValueError(f"unsupported MLX embedding architecture {config.get('model_type')!r}")
+        try:
+            from mlx_embeddings import load
+        except ImportError as exc:
+            raise RuntimeError("Install MLX embeddings with: uv sync --extra mlx-embeddings --extra serve") from exc
         # Lazy constants retain this stream; the backend lock guards all calls.
-        stream = mx.new_thread_unsafe_stream(mx.cpu if device == "cpu" else mx.gpu)
         with mx.stream(stream):
             model, tokenizer = load(str(path), lazy=False,
                                     tokenizer_config={"local_files_only": True, "trust_remote_code": False})
@@ -212,15 +242,17 @@ class MLXEmbeddingBackend:
 
 def load_embedding_backend(source, *, backend="auto", revision=None, device="auto", dtype="auto",
                            local_files_only=False, context_length=8192, gpu_layers=None,
-                           flash_attn=False, pooling="auto", gguf_server_path=None):
+                           flash_attn=False, pooling="auto", gguf_server_path=None, mmproj_path=None,
+                           max_input_tokens=4096):
     backend = model_backend(source, backend)
     if backend == "gguf":
         if revision is not None or dtype != "auto":
             raise ValueError("GGUF embeddings do not accept revision or dtype")
-        return GGUFEmbeddingBackend.load(source, device=device, context_length=context_length,
+        return GGUFEmbeddingBackend.load(source, device=device,
+                                         context_length=min(context_length, max_input_tokens) if mmproj_path else context_length,
                                          gpu_layers=gpu_layers, flash_attn=flash_attn, pooling=pooling,
-                                         gguf_server_path=gguf_server_path)
-    if gpu_layers is not None or flash_attn or context_length != 8192 or pooling != "auto" or gguf_server_path is not None:
-        raise ValueError("context_length, gpu_layers, flash_attn, pooling, and gguf_server_path are GGUF-only embedding options")
+                                         gguf_server_path=gguf_server_path, mmproj_path=mmproj_path)
+    if gpu_layers is not None or flash_attn or context_length != 8192 or pooling != "auto" or gguf_server_path is not None or mmproj_path is not None:
+        raise ValueError("context_length, gpu_layers, flash_attn, pooling, gguf_server_path, and mmproj_path are GGUF-only embedding options")
     loader = MLXEmbeddingBackend if backend == "mlx" else HFEmbeddingBackend
     return loader.load(source, revision=revision, device=device, dtype=dtype, local_files_only=local_files_only)

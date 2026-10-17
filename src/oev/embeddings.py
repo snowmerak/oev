@@ -1,10 +1,12 @@
-"""Serve dense text embeddings from one resident, serialized model."""
+"""Serve dense embeddings from one resident, serialized model."""
 
 from __future__ import annotations
 
 from datetime import date
 import math
 from threading import Lock
+
+from .embedding_inputs import validate_inputs
 
 
 class EmbeddingService:
@@ -37,20 +39,22 @@ class EmbeddingService:
                         device="auto", dtype="auto", local_files_only=False,
                         max_input_tokens=4096, max_concurrency=4, context_length=8192,
                         gpu_layers=None, flash_attn=False, pooling="auto",
-                        query_prefix=None, document_prefix=None, gguf_server_path=None):
+                        query_prefix=None, document_prefix=None, gguf_server_path=None, mmproj_path=None):
         from .embedding_backends import load_embedding_backend
 
         loaded = load_embedding_backend(
             source, backend=backend, revision=revision, device=device, dtype=dtype,
             local_files_only=local_files_only, context_length=context_length,
             gpu_layers=gpu_layers, flash_attn=flash_attn, pooling=pooling, gguf_server_path=gguf_server_path,
+            mmproj_path=mmproj_path, max_input_tokens=max_input_tokens,
         )
         return cls(loaded, model, max_input_tokens=max_input_tokens,
                    max_concurrency=max_concurrency, query_prefix=query_prefix, document_prefix=document_prefix)
 
     def models(self):
+        modalities = "/".join(sorted(getattr(self.backend, "modalities", {"text"})))
         return {"models": [{"name": self.model,
-                            "description": f"oev text embeddings; {self.backend.dimension} dimensions.",
+                            "description": f"oev {modalities} embeddings; {self.backend.dimension} dimensions.",
                             "release_date": date.today().isoformat()}]}
 
     def close(self):
@@ -60,10 +64,12 @@ class EmbeddingService:
                 close()
 
     def embed(self, texts, *, dimensions=None, input_type=None):
-        if not isinstance(texts, list) or not 1 <= len(texts) <= 128 or any(
-            not isinstance(text, str) or not text.strip() for text in texts
-        ):
-            raise ValueError("input must contain 1 to 128 nonempty text strings")
+        validate_inputs(texts)
+        modalities = getattr(self.backend, "modalities", {"text"})
+        for item in texts:
+            if isinstance(item, dict) and item.keys() - modalities:
+                missing = ", ".join(sorted(item.keys() - modalities))
+                raise ValueError(f"embedding model does not support {missing} input; load an EmbeddingGemma2 media encoder")
         dimension = self.backend.dimension
         if dimensions is not None:
             if type(dimensions) is not int or not 1 <= dimensions <= dimension:
@@ -76,7 +82,11 @@ class EmbeddingService:
                 raise ValueError(f"no {input_type} prefix is configured for this embedding model")
         prefix = self.prompts[input_type] if input_type is not None else ""
         with self._lock:
-            vectors, tokens = self.backend.embed([prefix + text for text in texts], self.max_input_tokens)
+            if any(isinstance(item, dict) and item.keys() - {"text"} for item in texts):
+                vectors, tokens = self.backend.embed_multimodal(texts, self.max_input_tokens, prompt=prefix)
+            else:
+                vectors, tokens = self.backend.embed(
+                    [prefix + (item if isinstance(item, str) else item["text"]) for item in texts], self.max_input_tokens)
         if len(vectors) != len(texts) or type(tokens) is not int or tokens < len(texts):
             raise RuntimeError("embedding backend returned invalid output or usage")
         normalized = []

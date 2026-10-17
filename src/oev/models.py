@@ -48,7 +48,8 @@ class ModelRegistry:
             "object": "list",
             "data": [
                 {"id": name, "object": "model", "created": 0, "owned_by": "oev",
-                 **(service.model_metadata() if isinstance(service, SystemOneService) else {"task": "embedding"})}
+                 **(service.model_metadata() if isinstance(service, SystemOneService) else {
+                     "task": "embedding", "input_modalities": sorted(getattr(service.backend, "modalities", {"text"}))})}
                 for name, service in self._services.items()
             ],
         }

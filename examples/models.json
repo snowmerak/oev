@@ -121,6 +121,15 @@
     "max_concurrency": 1
   },
   {
+    "model": "mlx-community/embeddinggemma-2-bf16",
+    "served_model": "embedding-gemma2-mlx-metal",
+    "task": "embedding",
+    "backend": "mlx",
+    "device": "mps",
+    "max_input_tokens": 8192,
+    "max_concurrency": 1
+  },
+  {
     "model": "./models/mlx-qwen3-embedding",
     "served_model": "embedding-qwen3-mlx-metal",
     "task": "embedding",
