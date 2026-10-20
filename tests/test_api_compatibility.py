@@ -277,7 +277,7 @@ def test_stored_history_pagination_instructions_and_delete():
     assert "NEW" in prompt and "OLD" not in prompt and "first" in prompt and "second" in prompt
     url = "/v1/responses/" + second["id"] + "/input_items"
     page = client.get(url, params={"limit": 1, "order": "asc"}).json()
-    assert page["has_more"] and page["data"][0]["content"] == "first"
+    assert page["has_more"] and page["data"][0]["content"] == [{"type": "input_text", "text": "first"}]
     next_page = client.get(url, params={"after": page["last_id"], "order": "asc"}).json()
     assert len(next_page["data"]) == 2
     assert client.delete("/v1/responses/" + first["id"]).status_code == 200

@@ -1,8 +1,8 @@
 """Validated OpenAI text/function request contracts."""
 
-from typing import Literal
+from typing import Annotated, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .completion import check_schema, json_value
 from .generation import GenerationOptions
@@ -10,6 +10,22 @@ from .generation import GenerationOptions
 
 class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    _null_defaults: ClassVar[tuple[str, ...]] = ()
+    _null_metadata: ClassVar[tuple[str, ...]] = ()
+    _empty_metadata: ClassVar[tuple[str, ...]] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_optional_fields(cls, values):
+        if isinstance(values, dict):
+            values = values.copy()
+            for key in cls._null_defaults + cls._null_metadata:
+                if values.get(key) is None:
+                    values.pop(key, None)
+            for key in cls._empty_metadata:
+                if values.get(key) == []:
+                    values.pop(key)
+        return values
 
 
 Effort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -18,6 +34,30 @@ Effort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 class TextPart(APIModel):
     type: Literal["text"]
     text: str
+
+
+class RefusalPart(APIModel):
+    type: Literal["refusal"]
+    refusal: str
+
+
+ChatPart = Annotated[TextPart | RefusalPart, Field(discriminator="type")]
+
+
+def message_text(content, refusal=None):
+    text = content if isinstance(content, str) else ""
+    previous_refusal = False
+    for part in content if isinstance(content, list) else []:
+        is_refusal = isinstance(part, RefusalPart)
+        value = part.refusal if is_refusal else part.text
+        if value:
+            if text and (is_refusal or previous_refusal):
+                text += "\n"
+            text += value
+            previous_refusal = is_refusal
+    if refusal and refusal != text:
+        text = text + "\n" + refusal if text else refusal
+    return text
 
 
 class FunctionCall(APIModel):
@@ -40,8 +80,12 @@ class ToolCall(APIModel):
 
 
 class ChatMessage(APIModel):
+    _null_defaults = ("tool_calls",)
+    _null_metadata = ("annotations", "audio", "function_call")
+    _empty_metadata = ("annotations",)
+
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | list[TextPart] | None = None
+    content: str | list[ChatPart] | None = None
     name: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list, max_length=128)
     tool_call_id: str | None = None
@@ -56,7 +100,9 @@ class ChatMessage(APIModel):
             for key in ("reasoning", "thinking"):
                 if key in values:
                     thought = values.pop(key)
-                    if "reasoning_content" in values and values["reasoning_content"] != thought:
+                    if thought is None:
+                        continue
+                    if values.get("reasoning_content") is not None and values["reasoning_content"] != thought:
                         raise ValueError("conflicting assistant reasoning fields")
                     values["reasoning_content"] = thought
         return values
@@ -67,14 +113,17 @@ class ChatMessage(APIModel):
             raise ValueError("tool_calls requires role=assistant")
         if (self.role == "tool") != bool(self.tool_call_id):
             raise ValueError("tool_call_id is required only for tool messages")
-        if self.content is None and not self.tool_calls:
-            raise ValueError("content is required unless the assistant invokes a tool")
+        if self.content is None and self.role != "assistant":
+            raise ValueError("content is required for non-assistant messages")
+        if self.role != "assistant" and (self.refusal or (
+            isinstance(self.content, list) and any(isinstance(part, RefusalPart) for part in self.content)
+        )):
+            raise ValueError("refusal requires role=assistant")
         return self
 
     def message(self):
-        text = self.content if isinstance(self.content, str) else "".join(part.text for part in self.content or [])
-        value = {"role": self.role, "content": text}
-        for key in ("name", "tool_call_id", "reasoning_content"):
+        value = {"role": self.role, "content": message_text(self.content, self.refusal)}
+        for key in ("name", "tool_call_id", "reasoning_content", "refusal"):
             if getattr(self, key) is not None:
                 value[key] = getattr(self, key)
         if self.tool_calls:
@@ -280,25 +329,54 @@ class ChatCompletionRequest(GenerationRequest):
 
 
 class InputText(APIModel):
+    _null_defaults = ("annotations", "logprobs")
+
     type: Literal["input_text", "output_text"]
     text: str
     annotations: list = Field(default_factory=list)
     logprobs: list = Field(default_factory=list)
 
 
+ResponsePart = Annotated[InputText | RefusalPart, Field(discriminator="type")]
+
+
 class InputMessage(APIModel):
     type: Literal["message"] = "message"
     role: Literal["system", "developer", "user", "assistant"]
-    content: str | list[InputText]
+    content: str | list[ResponsePart]
     id: str | None = None
     status: Literal["completed", "incomplete", "in_progress"] | None = None
     phase: Literal["commentary", "final_answer"] | None = None
 
+    @model_validator(mode="after")
+    def validate_refusal_role(self):
+        if self.role != "assistant" and isinstance(self.content, list) and any(
+            isinstance(part, RefusalPart) for part in self.content
+        ):
+            raise ValueError("refusal requires role=assistant")
+        return self
+
     def message(self):
-        return {"role": self.role, "content": self.content if isinstance(self.content, str) else "".join(part.text for part in self.content)}
+        value = {"role": self.role, "content": message_text(self.content)}
+        if self.phase is not None:
+            value["phase"] = self.phase
+        return value
+
+    def item(self):
+        value = self.model_dump(exclude_none=True, exclude_unset=True)
+        value.update(type="message", status=self.status or "completed")
+        if isinstance(self.content, str):
+            value["content"] = [{"type": "output_text" if self.role == "assistant" else "input_text",
+                                 "text": self.content}]
+        for part in value["content"]:
+            if part["type"] == "output_text":
+                part.setdefault("annotations", [])
+        return value
 
 
 class InputFunctionCall(APIModel):
+    _null_metadata = ("async", "caller", "namespace")
+
     type: Literal["function_call"]
     call_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
@@ -308,6 +386,8 @@ class InputFunctionCall(APIModel):
 
 
 class InputFunctionOutput(APIModel):
+    _null_metadata = ("caller", "namespace", "name")
+
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1)
     output: str | list[InputText]
@@ -321,6 +401,9 @@ class SummaryText(APIModel):
 
 
 class InputReasoning(APIModel):
+    _null_defaults = ("summary", "content")
+    _null_metadata = ("encrypted_content",)
+
     type: Literal["reasoning"]
     id: str | None = None
     summary: list[SummaryText] = Field(default_factory=list)
@@ -328,7 +411,8 @@ class InputReasoning(APIModel):
     status: Literal["completed", "incomplete", "in_progress"] | None = None
 
 
-InputItem = InputMessage | InputFunctionCall | InputFunctionOutput | InputReasoning
+InputItem = Annotated[InputMessage | InputFunctionCall | InputFunctionOutput | InputReasoning,
+                      Field(discriminator="type")]
 
 
 class ResponsesRequest(GenerationRequest):
@@ -343,6 +427,14 @@ class ResponsesRequest(GenerationRequest):
     truncation: Literal["disabled"] = "disabled"
     background: Literal[False] = False
 
+    @field_validator("input", mode="before")
+    @classmethod
+    def default_message_type(cls, value):
+        if isinstance(value, list):
+            return [{**item, "type": "message"}
+                    if isinstance(item, dict) and item.get("type") is None else item for item in value]
+        return value
+
     @model_validator(mode="after")
     def validate_options(self):
         if isinstance(self.input, list) and len(self.input) > 4096:
@@ -352,8 +444,9 @@ class ResponsesRequest(GenerationRequest):
 
     def input_items(self):
         if isinstance(self.input, str):
-            return [{"type": "message", "role": "user", "content": self.input}]
-        return [item.model_dump(exclude_none=True) for item in self.input]
+            return [InputMessage(role="user", content=self.input).item()]
+        return [item.item() if isinstance(item, InputMessage) else item.model_dump(exclude_none=True)
+                for item in self.input]
 
     def messages(self, items=None):
         messages = []
@@ -363,11 +456,16 @@ class ResponsesRequest(GenerationRequest):
         for value in self.input_items() if items is None else items:
             kind = value.get("type", "message")
             if kind == "reasoning":
-                thought = "\n".join(part["text"] for part in value.get("content") or value.get("summary", []))
+                text = "\n".join(part["text"] for part in value.get("content") or value.get("summary", []))
+                thought = "\n".join(part for part in (thought, text) if part)
             elif kind == "message":
                 message = InputMessage.model_validate(value).message()
-                if message["role"] == "assistant" and thought:
-                    message["reasoning_content"], thought = thought, ""
+                if thought:
+                    if message["role"] == "assistant":
+                        message["reasoning_content"] = thought
+                    else:
+                        messages.append({"role": "assistant", "content": "", "reasoning_content": thought})
+                    thought = ""
                 messages.append(message)
             elif kind == "function_call":
                 call = {"id": value["call_id"], "type": "function", "function": {"name": value["name"], "arguments": value["arguments"]}}
@@ -379,6 +477,8 @@ class ResponsesRequest(GenerationRequest):
             else:
                 output = value["output"]
                 messages.append({"role": "tool", "tool_call_id": value["call_id"], "content": output if isinstance(output, str) else "".join(part["text"] for part in output)})
+        if thought:
+            messages.append({"role": "assistant", "content": "", "reasoning_content": thought})
         if self.text.verbosity:
             messages.insert(0, {"role": "system", "content": {"low": "Be concise.", "medium": "Use moderate detail.", "high": "Provide a detailed answer."}[self.text.verbosity]})
         return messages

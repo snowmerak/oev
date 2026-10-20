@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import math
@@ -9,6 +10,7 @@ import json
 import re
 from threading import Event
 from typing import Iterator, Protocol
+from uuid import uuid4
 
 from .prompt import Tokenizer
 from .prompt_cache import CacheUsage, tracked_tokens
@@ -276,6 +278,32 @@ def sample_tokens(forward, model, input_ids, options, cancel):
         current_ids = [token] if cache is not None else history
 
 
+def render_generation_prompt(tokenizer, messages, kwargs):
+    candidates = [index for index, message in enumerate(messages)
+                  if message["role"] == "assistant" and not message["content"]
+                  and not message.get("tool_calls") and message.get("reasoning_content")]
+    if candidates:
+        # Probe rendering only: some native templates discard past thoughts,
+        # especially after a new user turn. These markers never reach inference.
+        probe = deepcopy(messages)
+        markers = {index: "oev_reasoning_" + uuid4().hex for index in candidates}
+        fields = ("reasoning_content", "reasoning", "thinking")
+        for index, marker in markers.items():
+            for name in fields:
+                if name in probe[index]:
+                    probe[index][name] = marker
+        rendered = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=True, **kwargs)
+        missing = [index for index, marker in markers.items() if marker not in rendered]
+        if missing:
+            messages = deepcopy(messages)
+            for index in missing:
+                message = messages[index]
+                message["content"] = "Previous assistant reasoning (no final answer):\n" + message["reasoning_content"]
+                for name in fields:
+                    message.pop(name, None)
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+
+
 class GenerationEngine:
     def __init__(self, backend: GenerationBackend, *, max_input_tokens: int = 4096,
                  tool_call_parser="auto", reasoning_parser="auto", chat_template_kwargs=None,
@@ -301,7 +329,7 @@ class GenerationEngine:
             role, content = message.get("role"), message.get("content")
             if role not in {"system", "developer", "user", "assistant", "tool"}:
                 raise ValueError("invalid message role")
-            if not isinstance(content, str) or (not content and not message.get("tool_calls") and role != "tool"):
+            if not isinstance(content, str) or (not content and role not in {"assistant", "tool"}):
                 raise ValueError("message content must be nonempty text")
             normalized.append({**message, "role": "system" if role == "developer" else role, "content": content})
         while len(normalized) > 1 and normalized[0]["role"] == normalized[1]["role"] == "system":
@@ -329,9 +357,7 @@ class GenerationEngine:
             kwargs["tools"] = list(options.tools)
         if options.chat_template:
             kwargs["chat_template"] = options.chat_template
-        prompt = self.backend.tokenizer.apply_chat_template(
-            normalized, tokenize=False, add_generation_prompt=True, **kwargs,
-        )
+        prompt = render_generation_prompt(self.backend.tokenizer, normalized, kwargs)
         ids = self.backend.tokenizer.encode(prompt, add_special_tokens=False)
         if not ids or len(ids) > self.max_input_tokens:
             raise ValueError(f"prompt has {len(ids)} tokens; limit is {self.max_input_tokens}; truncation is disabled")

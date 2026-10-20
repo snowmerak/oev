@@ -40,6 +40,36 @@ class APIError(Exception):
         }}
 
 
+def validation_issue(exc):
+    def union_branch(part):
+        return isinstance(part, str) and (part == "str" or part.startswith(("list[", "dict[")))
+
+    errors = exc.errors()
+    # A list input also produces a failing scalar branch. Report the error
+    # inside the matching container instead of asking the caller for a string.
+    relevant = [error for error in errors if not (
+        error["type"] in {"string_type", "list_type", "dict_type"}
+        and union_branch(error["loc"][-1])
+    )]
+    error = (relevant or errors)[0]
+    location = error["loc"]
+    kinds = {"message", "function_call", "function_call_output", "reasoning",
+             "text", "input_text", "output_text", "refusal"}
+    path = []
+    for index, part in enumerate(location):
+        if index == 0 and part in {"body", "query", "path"}:
+            continue
+        if union_branch(part) and not (index == len(location) - 1 and error["type"] == "extra_forbidden"):
+            continue
+        if (index and isinstance(location[index - 1], int) and part in kinds
+                and not (index == len(location) - 1 and error["type"] == "extra_forbidden")):
+            continue  # Pydantic's discriminator tag is not a JSON field.
+        path.append(str(part))
+    param = ".".join(path) or None
+    message = f"Unsupported request field: {param}" if error["type"] == "extra_forbidden" else error["msg"]
+    return APIError(message, param=param)
+
+
 def prepare(service, model, messages, options):
     if model != service.model:
         raise APIError(f"model must be {service.model!r}", status=404, code="model_not_found", param="model")
@@ -460,12 +490,9 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
-        if request.url.path not in OPENAI_PATHS:
+        if not any(request.url.path == path or request.url.path.startswith(path + "/") for path in OPENAI_PATHS):
             return await request_validation_exception_handler(request, exc)
-        error = exc.errors()[0]
-        param = ".".join(str(part) for part in error["loc"] if part != "body")
-        message = f"Unsupported request field: {param}" if error["type"] == "extra_forbidden" else error["msg"]
-        return JSONResponse(APIError(message, param=param).body(), status_code=400)
+        return JSONResponse(validation_issue(exc).body(), status_code=400)
 
     @app.post("/v1/chat/completions")
     def chat_completions(body: ChatCompletionRequest, request: Request):
