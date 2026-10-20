@@ -136,6 +136,7 @@ class SystemOneService:
         chat_template_kwargs: dict | None = None,
         chat_template: str | None = None,
         default_max_output_tokens: int = 8192,
+        generation_defaults: dict | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
@@ -145,6 +146,7 @@ class SystemOneService:
         self.model = model
         self.release_date = release_date or date.today().isoformat()
         self.max_concurrency = max_concurrency
+        self.generation_defaults = dict(generation_defaults or {})
         self._inference_slots = BoundedSemaphore(max_concurrency)
         self._generation_options = {
             "tool_call_parser": tool_call_parser, "reasoning_parser": reasoning_parser,
@@ -203,6 +205,8 @@ class SystemOneService:
                     "max_output_tokens": min(32768, context - 1) if context else 32768,
                     "context_length": min(context, self.engine.max_input_tokens) if context else self.engine.max_input_tokens}
         metadata["default_max_output_tokens"] = min(self._generation_options["default_max_output_tokens"], context - 1) if context else self._generation_options["default_max_output_tokens"]
+        if self.generation_defaults:
+            metadata["generation_defaults"] = self.generation_defaults.copy()
         if context:
             metadata["context_window"] = context
         template = self._generation_options["chat_template"] or template_text(backend.tokenizer)

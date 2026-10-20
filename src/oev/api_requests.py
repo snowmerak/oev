@@ -191,22 +191,34 @@ class ReasoningConfig(APIModel):
     summary: Literal["auto", "concise", "detailed"] | None = "auto"
 
 
-class GenerationRequest(APIModel):
-    model: str
+class SamplingParameters(APIModel):
+    """Sampling settings shared by model defaults and generation requests."""
+
     temperature: float = Field(default=0.0, ge=0, le=2)
     top_p: float = Field(default=1.0, gt=0, le=1)
-    stream: bool = False
-    store: bool = False
-    tools: list[dict] = Field(default_factory=list, max_length=128)
-    tool_choice: str | dict = "auto"
-    parallel_tool_calls: bool = True
     seed: int | None = Field(default=None, ge=0, lt=2**64, strict=True)
     top_k: int = Field(default=0, ge=0, strict=True)
     min_p: float = Field(default=0, ge=0, le=1)
     presence_penalty: float = Field(default=0, ge=-2, le=2)
     frequency_penalty: float = Field(default=0, ge=-2, le=2)
     repetition_penalty: float = Field(default=1, gt=0)
-    logit_bias: dict[str, float] = Field(default_factory=dict, max_length=1024)
+    logit_bias: dict[str, Annotated[float, Field(ge=-100, le=100)]] = Field(default_factory=dict, max_length=1024)
+
+    @field_validator("logit_bias")
+    @classmethod
+    def token_ids(cls, values):
+        if any(not key.isdecimal() for key in values):
+            raise ValueError("logit_bias keys must be nonnegative integer token IDs")
+        return values
+
+
+class GenerationRequest(SamplingParameters):
+    model: str
+    stream: bool = False
+    store: bool = False
+    tools: list[dict] = Field(default_factory=list, max_length=128)
+    tool_choice: str | dict = "auto"
+    parallel_tool_calls: bool = True
     metadata: dict[str, str] = Field(default_factory=dict, max_length=16)
     user: str | None = None
     safety_identifier: str | None = None
@@ -255,10 +267,14 @@ class GenerationRequest(APIModel):
             raise ValueError("tool_choice requires tools")
         if choice not in {"none", "auto", "required"} and choice not in names:
             raise ValueError("tool_choice names an unavailable function")
-        for key in self.logit_bias:
-            if not key.isdecimal():
-                raise ValueError("logit_bias keys must be nonnegative integer token IDs")
         return self
+
+    def with_defaults(self, defaults):
+        # exclude_unset preserves explicit zeros, empty maps and seed=null;
+        # nullable request defaults have already been normalized to omissions.
+        if not defaults:
+            return self
+        return type(self).model_validate({**defaults, **self.model_dump(exclude_unset=True)})
 
     def choice(self):
         if isinstance(self.tool_choice, str):

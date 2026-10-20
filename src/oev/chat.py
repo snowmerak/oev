@@ -497,6 +497,7 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
     @app.post("/v1/chat/completions")
     def chat_completions(body: ChatCompletionRequest, request: Request):
         service = resolve(body.model)
+        body = body.with_defaults(service.generation_defaults)
         options = body.options()
         prepared = prepare(service, body.model, [item.message() for item in body.messages], options)
         options = prepared.options
@@ -523,6 +524,7 @@ def add_chat_routes(app: FastAPI, registry: ModelRegistry):
     @app.post("/v1/responses")
     def responses(body: ResponsesRequest, request: Request):
         service = resolve(body.model)
+        body = body.with_defaults(service.generation_defaults)
         history = body.input_items()
         if body.previous_response_id:
             previous, previous_input = stored(body.previous_response_id, "response")

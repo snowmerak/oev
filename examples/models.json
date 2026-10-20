@@ -41,6 +41,13 @@
   {
     "model": "./models/model.Q4_K_M.gguf",
     "served_model": "gguf-local-metal-flash-attn",
+    "generation_defaults": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 40,
+      "min_p": 0.05,
+      "repetition_penalty": 1.1
+    },
     "default_max_output_tokens": 8192,
     "prompt_cache_max_size": "256MiB",
     "backend": "gguf",
@@ -53,6 +60,13 @@
   {
     "model": "./models/mlx-small",
     "served_model": "mlx-local-small-metal",
+    "generation_defaults": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 40,
+      "min_p": 0.05,
+      "repetition_penalty": 1.1
+    },
     "prompt_cache_max_size": "256MiB",
     "backend": "mlx",
     "device": "auto",

@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .api_requests import SamplingParameters
 from .chat import add_chat_routes
 from .embedding_api import add_embedding_routes
 from .embeddings import EmbeddingService
@@ -149,6 +150,7 @@ class ModelConfig(BaseModel):
     max_input_tokens: int = Field(default=4096, ge=1, strict=True)
     max_concurrency: int = Field(default=4, ge=1, strict=True)
     default_max_output_tokens: int = Field(default=8192, ge=1, le=32768, strict=True)
+    generation_defaults: SamplingParameters = Field(default_factory=SamplingParameters)
     backend: Literal["auto", "hf", "gguf", "mlx"] = "auto"
     local_files_only: bool = Field(default=False, strict=True)
     context_length: int = Field(default=8192, ge=1, strict=True)
@@ -266,8 +268,8 @@ def model_configs(args, parser) -> list[ModelConfig]:
         if config.task == "embedding" and config.chat_template is not None:
             parser.error(f"model {config.name!r}: embedding models do not use chat_template")
         if config.task == "embedding" and (config.tool_call_parser != "auto" or config.reasoning_parser != "auto"
-                                            or config.chat_template_kwargs):
-            parser.error(f"model {config.name!r}: output parsers and template kwargs require generation")
+                                            or config.chat_template_kwargs or config.generation_defaults.model_fields_set):
+            parser.error(f"model {config.name!r}: output parsers, template kwargs and generation defaults require generation")
         if config.task == "generation" and (config.pooling != "auto" or config.embedding_query_prefix is not None
                                             or config.embedding_document_prefix is not None):
             parser.error(f"model {config.name!r}: pooling and embedding prefixes require task=embedding")
@@ -321,6 +323,7 @@ def _load_service(config: ModelConfig):
         tool_call_parser=config.tool_call_parser, reasoning_parser=config.reasoning_parser,
         chat_template_kwargs=config.chat_template_kwargs, chat_template=template,
         default_max_output_tokens=config.default_max_output_tokens,
+        generation_defaults=config.generation_defaults.model_dump(exclude_unset=True),
     )
 
 

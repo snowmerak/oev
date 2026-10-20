@@ -439,6 +439,27 @@ Messages support `system`, `developer`, `user`, `assistant`, and `tool` roles. D
 
 When a request omits its output limit, generation uses the model's `default_max_output_tokens` (8,192 by default), capped by the context remaining after template rendering. Set this field in a generation model's JSON entry or use `--default-max-output-tokens`. `/v1/models` advertises the default, and Responses reports the actual applied limit. Explicit limits accept 1–32,768 tokens and must fit the context; they are never increased automatically. The output budget includes both reasoning and answer tokens. Python `GenerationOptions()` retains its explicit 256-token default; set `max_new_tokens_explicit=False` to use the engine's model default.
 
+Set `generation_defaults` on each generation model in `--models-config` to choose its sampling defaults for Chat Completions and Responses, including streaming. For example (illustrative values, not a model-specific preset):
+
+```json
+[
+  {
+    "model": "./models/mlx-small",
+    "backend": "mlx",
+    "generation_defaults": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 40,
+      "min_p": 0.05,
+      "repetition_penalty": 1.1
+    },
+    "chat_template_kwargs": {"enable_thinking": true}
+  }
+]
+```
+
+Supported sampling defaults are `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `seed`, and `logit_bias`, with the same types and ranges as the API. Explicit request values override the model defaults, including `0`, `1`, empty `logit_bias`, and `seed=null` (which clears a configured seed). Other nullable sampling fields treat `null` as omission. Missing model defaults retain oev's existing values: temperature 0, top-p 1, top-k/min-p/presence/frequency 0, repetition penalty 1, no fixed seed, and no logit bias. Model checkpoint sampling presets are not imported automatically. Nonempty configured defaults appear in `/v1/models`; Responses reports the effective temperature and top-p. These settings apply only to the two generation APIs; SystemOne decisions and explicit Python `GenerationOptions` are unchanged. Thinking controls remain in `chat_template_kwargs`. The models config is loaded once with the model registry at startup; restart the server to apply edits.
+
 Prompts obey `--max-input-tokens`, and input is never truncated (`truncation="disabled"`). Token usage includes generated stop/EOS tokens, even when they are omitted from displayed text. A length-limited completion reports `finish_reason="length"`; Responses reports `status="incomplete"` with `incomplete_details.reason="max_output_tokens"`. A truncated turn preserves partial reasoning/text and withholds all proposed tool calls, including earlier complete calls in that turn. Missing required calls at a token limit do not become a parser error; malformed completed calls still return `invalid_model_output`. Multiple Chat choices run sequentially; output usage is summed and prompt usage is reported once. An unsigned 64-bit `seed` uses a request-local sampler, with `seed + choice_index` for multiple choices. Reproducibility applies within the same model/runtime/configuration; floating-point kernels and quantization can differ across backends.
 
 Function tools use each checkpoint's chat template, with a portable XML/JSON instruction when the template has no tool declarations. Parsers recognize Qwen/Hermes JSON, Qwen3-Coder/3.5/3.8 XML, Gemma/FunctionGemma, GLM, MiniMax M2, DeepSeek V3/V3.1/V3.2, Kimi K2, Llama/Mistral/Granite JSON, Pythonic/Olmo/LFM2, Step3 and Harmony calls. See the [protocol compatibility and configuration guide](docs/model-protocols.md) for exact supported forms, vLLM/SGLang research references and remaining variants. Explicit native delimiters work automatically; `tool_call_parser` config selects ambiguous unwrapped formats. Chat tools use `{ "type": "function", "function": { "name": ..., "parameters": ... } }`; Responses tools put `name`, `description`, `parameters`, and `strict` directly beside `type`. Choices may be `auto`, `none`, `required`, or a named function. Named/required choices and `parallel_tool_calls=false` are checked against completed generated results. `strict=true` validates function arguments against their schema. Unknown functions, malformed arguments, missing required calls, and schema mismatches in completed turns return `502 invalid_model_output`, so a client never receives an invalid executable call. The caller executes functions and sends their results; oev does not execute them.
