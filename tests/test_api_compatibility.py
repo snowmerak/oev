@@ -46,7 +46,6 @@ def test_q_agent_chat_tools_and_result_roundtrip(stream):
         assert "<tool_call>" not in response.text
         delta = next(event["choices"][0]["delta"] for event in events[:-1] if event["choices"][0]["delta"].get("tool_calls"))
         call = delta["tool_calls"][0]
-        call.pop("index")
         assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
         assistant = {"role": "assistant", "content": None, "tool_calls": [call]}
     else:
@@ -64,6 +63,45 @@ def test_q_agent_chat_tools_and_result_roundtrip(stream):
     prompt = backend.tokenizer.decode(backend.calls[-1][1])
     assert '"arguments": {"city": "Seoul"}' in prompt
     assert '"name": "weather"' in prompt and "Sunny, 20C" in prompt
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_parallel_streamed_tool_calls_replay_with_indices(stream):
+    second_call = '<tool_call>{"name":"weather","arguments":{"city":"Busan"}}</tool_call>'
+    client, backend = client_for(CALL + second_call)
+    body = chat_request(tools=[TOOL], stream=True, max_completion_tokens=512)
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    calls = [call for event in sse_events(response)[:-1]
+             for call in event["choices"][0]["delta"].get("tool_calls", [])]
+    assert [call["index"] for call in calls] == [0, 1]
+    body["messages"] += [{"role": "assistant", "content": None, "tool_calls": calls}]
+    body["messages"] += [{"role": "tool", "tool_call_id": call["id"], "content": city}
+                         for call, city in zip(calls, ("Sunny Seoul", "Rainy Busan"))]
+    body.update(stream=stream, store=True)
+    backend.text = "Seoul is sunny; Busan is rainy."
+    reply = client.post("/v1/chat/completions", json=body)
+    assert reply.status_code == 200, reply.text
+    prompt = backend.tokenizer.decode(backend.calls[-1][1])
+    history = json.loads(prompt.removesuffix("\nassistant: "))
+    replayed = next(message["tool_calls"] for message in history if message.get("tool_calls"))
+    assert [call["id"] for call in replayed] == [call["id"] for call in calls]
+    assert all("index" not in call for call in replayed)
+    assert [call["function"]["arguments"]["city"] for call in replayed] == ["Seoul", "Busan"]
+    assert "Sunny Seoul" in prompt and "Rainy Busan" in prompt
+
+
+@pytest.mark.parametrize("index", [-1, True, 0.5, "0"])
+def test_invalid_tool_call_indices_fail_before_inference(index):
+    client, backend = client_for()
+    call = {"id": "call_a", "index": index, "type": "function",
+            "function": {"name": "weather", "arguments": '{"city":"Seoul"}'}}
+    body = chat_request(messages=[{"role": "assistant", "content": None, "tool_calls": [call]},
+                                  {"role": "tool", "tool_call_id": "call_a", "content": "Sunny"}])
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "messages.0.tool_calls.0.index"
+    assert not backend.calls
 
 
 @pytest.mark.parametrize("stream", [False, True])

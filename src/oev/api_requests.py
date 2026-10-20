@@ -35,6 +35,8 @@ class ToolCall(APIModel):
     id: str = Field(min_length=1)
     type: Literal["function"] = "function"
     function: FunctionCall
+    # Clients may retain the streaming delta index when replaying a call.
+    index: int | None = Field(default=None, ge=0, strict=True, exclude=True)
 
 
 class ChatMessage(APIModel):

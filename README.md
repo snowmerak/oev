@@ -108,6 +108,8 @@ uv run --locked --extra hf --extra serve oev-serve --model google/gemma-4-E2B-it
 
 `OEV_HOST`, `OEV_PORT`, and `OEV_MAX_CONCURRENCY` default to `127.0.0.1`, `8000`, and `4`. The `--host`, `--port`, and `--max-concurrency` arguments override these environment variables. Each server process loads each configured model once and allows up to four simultaneous inferences **per model** by default, shared across that model's decisions and text generation. A generation holds one slot until it finishes or cancellation is observed. Questions within one decision request run sequentially, and requests wait when their model's concurrency limit is reached. Concurrent inference does not guarantee higher throughput and may increase GPU memory use depending on input length and generation KV caches.
 
+**HF with prompt caching enabled has an effective inference concurrency of 1 per model.** Set `--max-concurrency 1` (or `"max_concurrency": 1` in that model's config) when using a nonzero `prompt_cache_max_size`; a higher limit admits waiting requests but does not run cached HF inference in parallel. Without prompt caching, HF can run concurrent inferences. GGUF and MLX always serialize execution per model. Different resident models have independent execution locks and limits.
+
 The default device is `auto`. The example explicitly selects `hybrid-cuda` for a 6 GB CUDA GPU. This mode requires Gemma 4 and a CUDA GPU with bfloat16 support.
 
 ```json

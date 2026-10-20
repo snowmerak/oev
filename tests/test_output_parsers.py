@@ -101,7 +101,6 @@ def test_native_calls_http_and_result_replay(profile, raw, path, stream):
             events = sse_events(response)
             call = next(item["choices"][0]["delta"]["tool_calls"][0] for item in events[:-1]
                         if item.get("choices") and item["choices"][0]["delta"].get("tool_calls"))
-            call.pop("index")
             assistant = {"role": "assistant", "content": None, "tool_calls": [call]}
         else:
             assistant = response.json()["choices"][0]["message"]
